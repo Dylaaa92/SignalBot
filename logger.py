@@ -2,7 +2,7 @@
 import json
 from datetime import datetime
 
-LOG_LEVEL = "TRADE"  
+LOG_LEVEL = "DEBUG"  
 # options: "DEBUG", "TRADE"
 
 # events we always want to see in TRADE mode
