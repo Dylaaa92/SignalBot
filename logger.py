@@ -14,6 +14,7 @@ TRADE_EVENTS = {
     "stop_hit",
     "disabled_daily_max_loss",
     "enter_short_paper",
+    "candle_closed",
 }
 
 def log(payload: dict):
