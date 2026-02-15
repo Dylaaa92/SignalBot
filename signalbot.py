@@ -159,6 +159,7 @@ async def main():
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
     await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias")
 
+    last_hb = 0
 
     while True:
         try:
@@ -193,6 +194,13 @@ async def main():
                     candle_1h.update(closed["t"] + TF_SECONDS, closed["c"])
 
                     log({"event": "candle_closed", "t": closed["t"], "c": closed["c"]})
+
+                    # --- heartbeat ---
+                    now = int(time.time())
+                    if now - last_hb >= 3600:   # 1 hour
+                        last_hb = now
+                        log({"event": "heartbeat", "symbol": SYMBOL})
+
 
                     # ---- if an active signal exists, watch for TP hits ----
                     if sig.active:
