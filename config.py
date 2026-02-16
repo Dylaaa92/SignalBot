@@ -1,5 +1,9 @@
 import os
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
 # Runtime configuration via environment variables
 SYMBOL = os.getenv("SYMBOL", "BTC")
 ENV = os.getenv("ENV", "mainnet")  # default to mainnet
@@ -66,8 +70,6 @@ BE_BUFFER_PCT = 0.01 / 100    # tiny buffer above entry for BE stop
 RETEST_BUF_ATR = 0.15
 ACCEPT_BARS = 2
 ATR_LEN = 14
-TELEGRAM_BOT_TOKEN = "8587275237:AAGIPV4QWu6vcu5EKsCge9PkpOScJRHs83M"
-TELEGRAM_CHAT_ID = "7664213318"   # can be a number like 123456789 or "-100..." for groups
 
 
 
