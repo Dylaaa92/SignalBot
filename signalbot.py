@@ -24,7 +24,12 @@ from trade_events import append_event, new_trade_id
 ONE_HOUR = 3600
 
 async def handle_command(text: str):
-    parts = text.split()
+    global grid
+	if grid is None:
+    await notify(f"{SYMBOL}: Grid not enabled on this bot.")
+    return
+
+	parts = text.split()
     cmd = parts[0].lower()
 
     if len(parts) < 2:
@@ -252,8 +257,13 @@ async def main():
     sub_msg = {"method": "subscribe", "subscription": {"type": "allMids"}}
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
     await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
-    grid = GridBot(SYMBOL, ENV)
-    asyncio.create_task(grid.loop())
+
+	grid = None
+
+	if os.getenv("GRID_ENABLED", "0") == "1":
+	    grid = GridBot(SYMBOL, ENV)
+	    asyncio.create_task(grid.loop())
+
 	
     last_hb = 0
 
