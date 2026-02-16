@@ -37,11 +37,6 @@ STRUCT_PAD_ATR = 0.10      # structure pad = ATR * 0.10
 ATR_SEATBELT_MULT = 1.2    # ATR seatbelt trail distance = ATR * 1.2
 RUNNER_TIME_STOP_BARS = 12 # after TP1, exit runner after 12 bars (~60 mins)
 
-# Optional filters (keep OFF unless you implement them)
-USE_VWAP_FILTER = False
-USE_RSI_FILTER = False
-USE_VOL_FILTER = False
-
 
 class CandleBuilder:
     def __init__(self, tf_seconds: int):
@@ -91,6 +86,17 @@ def crossed_up(prev_fast, prev_slow, fast, slow) -> bool:
     return (prev_fast is not None and prev_slow is not None) and (prev_fast <= prev_slow and fast > slow)
 
 
+def safe_append(event: dict):
+    """
+    Never let a filesystem write crash the bot.
+    Logs an error to bot logger instead.
+    """
+    try:
+        append_event(SYMBOL, event)
+    except Exception as e:
+        log({"event": "trade_event_write_failed", "error": str(e), "type": event.get("type")})
+
+
 class StructureState:
     """
     BOS -> Retest -> Accept state (per symbol instance).
@@ -108,9 +114,6 @@ class StructureState:
         self.bosSwingLow = None    # for long stop
         self.bosSwingHigh = None   # for short stop
 
-        # Optional timeout tracking
-        self.armedBarIndex = None
-
     def reset(self):
         self.__init__()
 
@@ -127,6 +130,9 @@ class SignalTradeState:
         self.phase = None         # "PRE_TP1" or "RUNNER"
         self.side = None          # "LONG" / "SHORT"
 
+        self.trade_id = None
+        self.entry_t = None
+
         self.entry = None
         self.stop_init = None
         self.R = None
@@ -134,7 +140,7 @@ class SignalTradeState:
 
         # TP1 bookkeeping
         self.tp1_sent = False
-        self.tp1_bar_index = None
+        self.tp1_t = None
 
         # Runner tracking
         self.struct_stop = None
@@ -184,8 +190,8 @@ async def main():
     structure = StructureState()
     sig = SignalTradeState()
 
-    # Keeping profiles in place (even though stop is ATR-based now)
-    profile = SYMBOL_PROFILES.get(SYMBOL, DEFAULT_PROFILE)
+    # Keep profiles in place (unused for stop now, but harmless)
+    _profile = SYMBOL_PROFILES.get(SYMBOL, DEFAULT_PROFILE)
 
     candle_5m = CandleBuilder(TF_SECONDS)
     candle_1h = CandleBuilder(ONE_HOUR)
@@ -207,7 +213,7 @@ async def main():
 
     sub_msg = {"method": "subscribe", "subscription": {"type": "allMids"}}
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
-    await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner")
+    await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
 
     last_hb = 0
 
@@ -253,13 +259,14 @@ async def main():
                     if len(candle_5m.candles) < 120 or len(candle_1h.candles) < 40:
                         continue
 
-                    c5 = candle_5m.candles
+                    c5_full = candle_5m.candles
                     c1 = candle_1h.candles
 
-                    # Use recent windows
-                    closes5 = [c["c"] for c in c5][-300:]
-                    highs5 = [c["h"] for c in c5][-300:]
-                    lows5 = [c["l"] for c in c5][-300:]
+                    # Use a consistent 5m window (align indices for pivots + timestamps)
+                    c5w = c5_full[-300:]
+                    closes5 = [c["c"] for c in c5w]
+                    highs5 = [c["h"] for c in c5w]
+                    lows5 = [c["l"] for c in c5w]
                     closes1 = [c["c"] for c in c1][-200:]
 
                     # EMAs
@@ -275,8 +282,8 @@ async def main():
                     emaTrendLong = efast5 > eslow5
                     emaTrendShort = efast5 < eslow5
 
-                    # ATR + buffers
-                    a = atr_from_candles(c5, length=ATR_LEN)
+                    # ATR + buffers (use same window list)
+                    a = atr_from_candles(c5w, length=ATR_LEN)
                     if a is None:
                         continue
                     retest_buf = a * RETEST_BUF_ATR
@@ -284,7 +291,7 @@ async def main():
                     struct_pad = a * STRUCT_PAD_ATR
                     atr_seatbelt_dist = a * ATR_SEATBELT_MULT
 
-                    # pivots (confirmed)
+                    # pivots (confirmed) on window
                     idx_hi = last_confirmed_swing_high(highs5, PIVOT_L)
                     idx_lo = last_confirmed_swing_low(lows5, PIVOT_L)
                     if idx_hi is None or idx_lo is None:
@@ -293,7 +300,7 @@ async def main():
                     lastSwingHigh = highs5[idx_hi]
                     lastSwingLow = lows5[idx_lo]
 
-                    prev_close = c5[-2]["c"]
+                    prev_close = c5w[-2]["c"]
                     bosUp = (prev_close <= lastSwingHigh) and (closed["c"] > lastSwingHigh)
                     bosDown = (prev_close >= lastSwingLow) and (closed["c"] < lastSwingLow)
 
@@ -301,20 +308,37 @@ async def main():
                     # 1) Manage active signal first
                     # ============================
                     if sig.active:
-                        # PRE_TP1 phase: TP1 + stop
+                        # PRE_TP1: initial stop + TP1
                         if sig.phase == "PRE_TP1":
                             if sig.side == "LONG":
-                                # stop tagged?
                                 if closed["l"] <= sig.stop_init:
                                     await notify(f"{SYMBOL} LONG invalidated ❌ stop tagged {sig.stop_init:.2f}")
+                                    safe_append({
+                                        "type": "STOP",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "phase": "PRE_TP1",
+                                        "stop": sig.stop_init,
+                                        "exit_price": sig.stop_init,
+                                        "t": closed["t"],
+                                    })
                                     sig.clear()
-                                # TP1 hit?
+
                                 elif (not sig.tp1_sent) and closed["h"] >= sig.tp1:
                                     sig.tp1_sent = True
-                                    sig.tp1_bar_index = len(c5) - 1
-                                    await notify(f"{SYMBOL} LONG TP1 ✅ hit {sig.tp1:.2f} (paper close {int(TP1_PARTIAL_PCT*100)}%)")
+                                    sig.tp1_t = closed["t"]
 
-                                    # enter RUNNER phase
+                                    await notify(f"{SYMBOL} LONG TP1 ✅ hit {sig.tp1:.2f} (paper close {int(TP1_PARTIAL_PCT*100)}%)")
+                                    safe_append({
+                                        "type": "TP1",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "tp1": sig.tp1,
+                                        "tp1_partial_pct": TP1_PARTIAL_PCT,
+                                        "tp1_t": sig.tp1_t,
+                                        "t": closed["t"],
+                                    })
+
                                     sig.phase = "RUNNER"
                                     sig.highest_high_since_tp1 = closed["h"]
                                     sig.lowest_low_since_tp1 = closed["l"]
@@ -324,11 +348,31 @@ async def main():
                             else:  # SHORT
                                 if closed["h"] >= sig.stop_init:
                                     await notify(f"{SYMBOL} SHORT invalidated ❌ stop tagged {sig.stop_init:.2f}")
+                                    safe_append({
+                                        "type": "STOP",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "phase": "PRE_TP1",
+                                        "stop": sig.stop_init,
+                                        "exit_price": sig.stop_init,
+                                        "t": closed["t"],
+                                    })
                                     sig.clear()
+
                                 elif (not sig.tp1_sent) and closed["l"] <= sig.tp1:
                                     sig.tp1_sent = True
-                                    sig.tp1_bar_index = len(c5) - 1
+                                    sig.tp1_t = closed["t"]
+
                                     await notify(f"{SYMBOL} SHORT TP1 ✅ hit {sig.tp1:.2f} (paper close {int(TP1_PARTIAL_PCT*100)}%)")
+                                    safe_append({
+                                        "type": "TP1",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "tp1": sig.tp1,
+                                        "tp1_partial_pct": TP1_PARTIAL_PCT,
+                                        "tp1_t": sig.tp1_t,
+                                        "t": closed["t"],
+                                    })
 
                                     sig.phase = "RUNNER"
                                     sig.highest_high_since_tp1 = closed["h"]
@@ -336,31 +380,24 @@ async def main():
                                     sig.struct_stop = None
                                     sig.atr_stop = None
 
-                        # RUNNER phase: best-of stops + EMA cross exit + time stop
+                        # RUNNER: best-of stops + EMA cross exit + time stop
                         elif sig.phase == "RUNNER":
-                            # update extrema since TP1
                             sig.highest_high_since_tp1 = max(sig.highest_high_since_tp1, closed["h"])
                             sig.lowest_low_since_tp1 = min(sig.lowest_low_since_tp1, closed["l"])
 
                             # BE stop
-                            if sig.side == "LONG":
-                                be_stop = sig.entry + be_buf
-                            else:
-                                be_stop = sig.entry - be_buf
+                            be_stop = (sig.entry + be_buf) if sig.side == "LONG" else (sig.entry - be_buf)
 
-                            # Structure trailing (confirmed pivots after TP1)
-                            # We reuse last_confirmed_swing_* on the full arrays;
-                            # then only apply if that pivot index is after TP1 bar index.
-                            new_struct_stop = None
-                            if sig.tp1_bar_index is not None:
+                            # Structure trailing AFTER TP1 using timestamps (robust)
+                            if sig.tp1_t is not None:
                                 if sig.side == "LONG":
                                     pidx = last_confirmed_swing_low(lows5, PIVOT_L)
-                                    if pidx is not None and pidx >= sig.tp1_bar_index:
+                                    if pidx is not None and c5w[pidx]["t"] >= sig.tp1_t:
                                         new_struct_stop = lows5[pidx] - struct_pad
                                         sig.struct_stop = max(sig.struct_stop, new_struct_stop) if sig.struct_stop is not None else new_struct_stop
                                 else:
                                     pidx = last_confirmed_swing_high(highs5, PIVOT_L)
-                                    if pidx is not None and pidx >= sig.tp1_bar_index:
+                                    if pidx is not None and c5w[pidx]["t"] >= sig.tp1_t:
                                         new_struct_stop = highs5[pidx] + struct_pad
                                         sig.struct_stop = min(sig.struct_stop, new_struct_stop) if sig.struct_stop is not None else new_struct_stop
 
@@ -383,16 +420,46 @@ async def main():
                                 # stop tagged?
                                 if closed["l"] <= runner_stop:
                                     await notify(f"{SYMBOL} LONG RUNNER 🏁 stop hit {runner_stop:.2f}")
+                                    safe_append({
+                                        "type": "RUNNER_EXIT",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "reason": "STOP",
+                                        "runner_stop": runner_stop,
+                                        "exit_price": runner_stop,
+                                        "tp1_t": sig.tp1_t,
+                                        "t": closed["t"],
+                                    })
                                     sig.clear()
                                 else:
-                                    # Forced exits
                                     ema_cross_exit = crossed_down(sig.prev_efast5, sig.prev_eslow5, efast5, eslow5)
-                                    time_exit = (len(c5) - 1 - sig.tp1_bar_index) >= RUNNER_TIME_STOP_BARS if sig.tp1_bar_index is not None else False
+                                    time_exit = (sig.tp1_t is not None) and ((closed["t"] - sig.tp1_t) >= 60 * 60)
+
                                     if ema_cross_exit:
                                         await notify(f"{SYMBOL} LONG RUNNER 🏁 EMA cross exit (9<21)")
+                                        safe_append({
+                                            "type": "RUNNER_EXIT",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "reason": "EMA_CROSS",
+                                            "exit_price": closed["c"],
+                                            "tp1_t": sig.tp1_t,
+                                            "ema5_fast": efast5,
+                                            "ema5_slow": eslow5,
+                                            "t": closed["t"],
+                                        })
                                         sig.clear()
                                     elif time_exit:
-                                        await notify(f"{SYMBOL} LONG RUNNER 🏁 time stop exit ({RUNNER_TIME_STOP_BARS} bars)")
+                                        await notify(f"{SYMBOL} LONG RUNNER 🏁 time stop exit (~60 mins)")
+                                        safe_append({
+                                            "type": "RUNNER_EXIT",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "reason": "TIME_STOP",
+                                            "exit_price": closed["c"],
+                                            "tp1_t": sig.tp1_t,
+                                            "t": closed["t"],
+                                        })
                                         sig.clear()
 
                             else:  # SHORT
@@ -404,18 +471,49 @@ async def main():
 
                                 if closed["h"] >= runner_stop:
                                     await notify(f"{SYMBOL} SHORT RUNNER 🏁 stop hit {runner_stop:.2f}")
+                                    safe_append({
+                                        "type": "RUNNER_EXIT",
+                                        "trade_id": sig.trade_id,
+                                        "side": sig.side,
+                                        "reason": "STOP",
+                                        "runner_stop": runner_stop,
+                                        "exit_price": runner_stop,
+                                        "tp1_t": sig.tp1_t,
+                                        "t": closed["t"],
+                                    })
                                     sig.clear()
                                 else:
                                     ema_cross_exit = crossed_up(sig.prev_efast5, sig.prev_eslow5, efast5, eslow5)
-                                    time_exit = (len(c5) - 1 - sig.tp1_bar_index) >= RUNNER_TIME_STOP_BARS if sig.tp1_bar_index is not None else False
+                                    time_exit = (sig.tp1_t is not None) and ((closed["t"] - sig.tp1_t) >= 60 * 60)
+
                                     if ema_cross_exit:
                                         await notify(f"{SYMBOL} SHORT RUNNER 🏁 EMA cross exit (9>21)")
+                                        safe_append({
+                                            "type": "RUNNER_EXIT",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "reason": "EMA_CROSS",
+                                            "exit_price": closed["c"],
+                                            "tp1_t": sig.tp1_t,
+                                            "ema5_fast": efast5,
+                                            "ema5_slow": eslow5,
+                                            "t": closed["t"],
+                                        })
                                         sig.clear()
                                     elif time_exit:
-                                        await notify(f"{SYMBOL} SHORT RUNNER 🏁 time stop exit ({RUNNER_TIME_STOP_BARS} bars)")
+                                        await notify(f"{SYMBOL} SHORT RUNNER 🏁 time stop exit (~60 mins)")
+                                        safe_append({
+                                            "type": "RUNNER_EXIT",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "reason": "TIME_STOP",
+                                            "exit_price": closed["c"],
+                                            "tp1_t": sig.tp1_t,
+                                            "t": closed["t"],
+                                        })
                                         sig.clear()
 
-                    # Update prev EMA values for next-bar cross detection (whether active or not)
+                    # Update prev EMA values for next-bar cross detection
                     sig.prev_efast5 = efast5
                     sig.prev_eslow5 = eslow5
 
@@ -423,7 +521,7 @@ async def main():
                     # 2) Structure state machine (only if not in active trade)
                     # ============================
                     if not sig.active:
-                        # If bias/trend flips while waiting, kill the setup (prevents stale arming)
+                        # If bias/trend flips while waiting, drop setup
                         if structure.waitingRetest:
                             if structure.direction == "LONG" and (not biasLong or not emaTrendLong):
                                 structure.reset()
@@ -439,7 +537,6 @@ async def main():
                             structure.retestRef = None
                             structure.accCount = 0
                             structure.bosSwingLow = lastSwingLow
-                            structure.armedBarIndex = len(c5) - 1
 
                         elif bosDown and biasShort and emaTrendShort:
                             structure.reset()
@@ -449,18 +546,15 @@ async def main():
                             structure.retestRef = None
                             structure.accCount = 0
                             structure.bosSwingHigh = lastSwingHigh
-                            structure.armedBarIndex = len(c5) - 1
 
                         # Retest
                         if structure.waitingRetest and structure.bosLevel is not None:
                             if structure.direction == "LONG":
-                                retest = closed["l"] <= (structure.bosLevel + retest_buf)
-                                if retest:
+                                if closed["l"] <= (structure.bosLevel + retest_buf):
                                     structure.retestRef = structure.bosLevel
                                     structure.accCount = 0
                             else:
-                                retest = closed["h"] >= (structure.bosLevel - retest_buf)
-                                if retest:
+                                if closed["h"] >= (structure.bosLevel - retest_buf):
                                     structure.retestRef = structure.bosLevel
                                     structure.accCount = 0
 
@@ -474,13 +568,12 @@ async def main():
                         accepted = structure.waitingRetest and structure.retestRef is not None and structure.accCount >= ACCEPT_BARS
 
                         # ============================
-                        # 3) Entry (signal-only) + init TP1 + runner
+                        # 3) Entry (signal-only) + init TP1 + JSON ENTER event
                         # ============================
                         if accepted:
                             entry = closed["c"]
 
                             if structure.direction == "LONG" and biasLong and emaTrendLong:
-                                # Stop from BOS anchor swing low - ATR pad
                                 if structure.bosSwingLow is None:
                                     structure.reset()
                                 else:
@@ -492,16 +585,39 @@ async def main():
                                         sig.active = True
                                         sig.phase = "PRE_TP1"
                                         sig.side = "LONG"
+                                        sig.trade_id = new_trade_id()
+                                        sig.entry_t = closed["t"]
                                         sig.entry = entry
                                         sig.stop_init = stop
                                         sig.R = R
                                         sig.tp1 = entry + TP1_R_MULT * R
 
+                                        safe_append({
+                                            "type": "ENTER",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "entry": sig.entry,
+                                            "stop": sig.stop_init,
+                                            "R": sig.R,
+                                            "tp1": sig.tp1,
+                                            "entry_t": sig.entry_t,
+                                            "atr": a,
+                                            "retest_buf": retest_buf,
+                                            "bos_level": structure.bosLevel,
+                                            "bos_swing_low": structure.bosSwingLow,
+                                            "ema5_fast": efast5,
+                                            "ema5_slow": eslow5,
+                                            "ema1_fast": efast1,
+                                            "ema1_slow": eslow1,
+                                            "t": closed["t"],
+                                        })
+
                                         await notify(
                                             f"{SYMBOL} LONG ✅ (BOS+Retest+Accept)\n"
                                             f"entry={entry:.2f} stop={stop:.2f}\n"
                                             f"TP1(1R)={sig.tp1:.2f}\n"
-                                            f"retest_buf={retest_buf:.2f} atr={a:.2f}"
+                                            f"atr={a:.2f} retest_buf={retest_buf:.2f}\n"
+                                            f"id={sig.trade_id}"
                                         )
                                         structure.reset()
 
@@ -517,20 +633,42 @@ async def main():
                                         sig.active = True
                                         sig.phase = "PRE_TP1"
                                         sig.side = "SHORT"
+                                        sig.trade_id = new_trade_id()
+                                        sig.entry_t = closed["t"]
                                         sig.entry = entry
                                         sig.stop_init = stop
                                         sig.R = R
                                         sig.tp1 = entry - TP1_R_MULT * R
 
+                                        safe_append({
+                                            "type": "ENTER",
+                                            "trade_id": sig.trade_id,
+                                            "side": sig.side,
+                                            "entry": sig.entry,
+                                            "stop": sig.stop_init,
+                                            "R": sig.R,
+                                            "tp1": sig.tp1,
+                                            "entry_t": sig.entry_t,
+                                            "atr": a,
+                                            "retest_buf": retest_buf,
+                                            "bos_level": structure.bosLevel,
+                                            "bos_swing_high": structure.bosSwingHigh,
+                                            "ema5_fast": efast5,
+                                            "ema5_slow": eslow5,
+                                            "ema1_fast": efast1,
+                                            "ema1_slow": eslow1,
+                                            "t": closed["t"],
+                                        })
+
                                         await notify(
                                             f"{SYMBOL} SHORT ✅ (BOS+Retest+Accept)\n"
                                             f"entry={entry:.2f} stop={stop:.2f}\n"
                                             f"TP1(1R)={sig.tp1:.2f}\n"
-                                            f"retest_buf={retest_buf:.2f} atr={a:.2f}"
+                                            f"atr={a:.2f} retest_buf={retest_buf:.2f}\n"
+                                            f"id={sig.trade_id}"
                                         )
                                         structure.reset()
                             else:
-                                # If accepted but bias not aligned at entry close, drop it
                                 structure.reset()
 
         except Exception as e:
