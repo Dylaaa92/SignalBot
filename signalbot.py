@@ -16,6 +16,7 @@ from indicators import ema
 from pivots import last_confirmed_swing_low, last_confirmed_swing_high
 from logger import log
 from notifier import notify
+from trade_events import append_event, new_trade_id
 
 ONE_HOUR = 3600
 
