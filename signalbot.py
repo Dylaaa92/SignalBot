@@ -48,10 +48,6 @@ class CandleBuilder:
         self.tf = tf_seconds
         self.current = None
         self.candles = []
-        self.trade_id = None
-        self.entry_t = None
-        self.runner_exit_reason = None
-
 
     def _bucket(self, ts: float) -> int:
         return int(ts // self.tf) * self.tf
