@@ -26,8 +26,8 @@ ONE_HOUR = 3600
 async def handle_command(text: str):
     global grid
 	if grid is None:
-    await notify(f"{SYMBOL}: Grid not enabled on this bot.")
-    return
+    	await notify(f"{SYMBOL}: Grid not enabled on this bot.")
+    	return
 
 	parts = text.split()
     cmd = parts[0].lower()
