@@ -34,6 +34,7 @@ SYMBOL_PROFILES = {
     # Higher volatility / more noise
     "JUP":    {"min_stop_pct": 0.60/100, "max_stop_pct": 3.00/100, "stop_buffer_pct": 0.10/100},
     "COIN":   {"min_stop_pct": 0.60/100, "max_stop_pct": 3.00/100, "stop_buffer_pct": 0.10/100},
+    "HYPE": {"min_stop_pct": 0.70/100, "max_stop_pct": 3.50/100, "stop_buffer_pct": 0.12/100},
 
     # Metals (often steadier, but can spike around macro)
     "GOLD":   {"min_stop_pct": 0.20/100, "max_stop_pct": 1.00/100, "stop_buffer_pct": 0.03/100},

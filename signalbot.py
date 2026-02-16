@@ -3,6 +3,9 @@ import json
 import time
 import httpx
 import websockets
+from grid_engine import GridBot, GridParams
+from telegram_control import telegram_poll_commands
+import os
 
 from config import (
     SYMBOL, TF_SECONDS,
@@ -19,6 +22,41 @@ from notifier import notify
 from trade_events import append_event, new_trade_id
 
 ONE_HOUR = 3600
+
+async def handle_command(text: str):
+    parts = text.split()
+    cmd = parts[0].lower()
+
+    if len(parts) < 2:
+        return
+
+    target_symbol = parts[1].upper()
+
+    # IMPORTANT: only respond if command matches this instance symbol
+    if target_symbol != SYMBOL:
+        return
+
+    if cmd == "/grid_start":
+        if len(parts) < 6:
+            await notify("Usage: /grid_start SYMBOL lower upper grids usd_per_order")
+            return
+
+        lower = float(parts[2])
+        upper = float(parts[3])
+        grids = int(parts[4])
+        usd = float(parts[5])
+
+        await grid.start(GridParams(lower, upper, grids, usd))
+
+    elif cmd == "/grid_stop":
+        await grid.stop()
+
+    elif cmd == "/grid_status":
+        await notify(await grid.status())
+
+    elif cmd == "/grid_rebuild":
+        await grid.rebuild()
+
 
 # ============================
 # Strategy params (FINAL LOGIC)
@@ -214,7 +252,9 @@ async def main():
     sub_msg = {"method": "subscribe", "subscription": {"type": "allMids"}}
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
     await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
-
+    grid = GridBot(SYMBOL, ENV)
+    asyncio.create_task(grid.loop())
+	
     last_hb = 0
 
     while True:
@@ -676,5 +716,12 @@ async def main():
             await asyncio.sleep(5)
 
 
+async def run_all():
+    tasks = [main()]
+    if os.getenv("TELEGRAM_CONTROL", "0") == "1":
+        tasks.append(telegram_poll_commands(handle_command))
+    await asyncio.gather(*tasks)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_all())
+
