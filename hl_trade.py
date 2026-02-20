@@ -2,6 +2,7 @@ import os
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
+from eth_account import Account
 
 def _api_url(env: str) -> str:
     return constants.MAINNET_API_URL if env == "mainnet" else constants.TESTNET_API_URL
@@ -18,7 +19,8 @@ class HL:
             raise RuntimeError("Missing HL_ACCOUNT_ADDRESS or HL_SECRET_KEY in environment")
 
         self.info = Info(self.api_url, skip_ws=True)
-        self.ex = Exchange(self.api_url, self.secret_key, account_address=self.account_address)
+        wallet = Account.from_key(self.secret_key)
+        self.ex = Exchange(wallet, base_url=self.api_url, account_address=self.account_address)
 
     def mid(self, coin: str) -> float:
         # You already subscribe to allMids, but this is useful as a fallback.
