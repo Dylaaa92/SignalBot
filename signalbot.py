@@ -25,22 +25,43 @@ ONE_HOUR = 3600
 
 async def handle_command(text: str):
     global grid
-	if grid is None:
-    	await notify(f"{SYMBOL}: Grid not enabled on this bot.")
-    	return
 
-	parts = text.split()
-    cmd = parts[0].lower()
+    t = (text or "").strip()
+    if not t:
+        return
 
+    parts = t.split()
+    cmd = parts[0].lower().split("@")[0]  # handles /start@BotName
+
+    # ---- Basic help ----
+    if cmd in ("/start", "/help"):
+        from notifier import notify
+        await notify(
+            "✅ SignalBot control is live.\n\n"
+            "Grid Commands:\n"
+            "/grid_start SYMBOL lower upper grids usd_per_order\n"
+            "/grid_stop SYMBOL\n"
+            "/grid_status SYMBOL\n"
+            "/grid_rebuild SYMBOL\n"
+        )
+        return
+
+    # ---- Grid not enabled on this instance ----
+    if grid is None:
+        await notify(f"{SYMBOL}: Grid not enabled on this bot.")
+        return
+
+    # ---- Require SYMBOL argument ----
     if len(parts) < 2:
         return
 
     target_symbol = parts[1].upper()
 
-    # IMPORTANT: only respond if command matches this instance symbol
+    # Only respond if command matches this instance
     if target_symbol != SYMBOL:
         return
 
+    # ---- Grid Commands ----
     if cmd == "/grid_start":
         if len(parts) < 6:
             await notify("Usage: /grid_start SYMBOL lower upper grids usd_per_order")
