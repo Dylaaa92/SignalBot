@@ -3,9 +3,11 @@ import json
 import time
 import httpx
 import websockets
+import subprocess
+import os
+
 from grid_engine import GridBot, GridParams
 from telegram_control import telegram_poll_commands
-import os
 
 from config import (
     SYMBOL, TF_SECONDS,
@@ -21,7 +23,34 @@ from logger import log
 from notifier import notify
 from trade_events import append_event, new_trade_id
 
+
+# ============================
+# SYSTEMD CONTROL (NEW)
+# ============================
+
+ALL_SYMBOLS = ["BTC", "ETH", "SOL", "JUP", "HYPE"]
+
+def _svc_name(sym: str) -> str:
+    return f"signalbot@{sym}.service"
+
+def _run_systemctl(action: str, symbols: list[str]):
+    services = [_svc_name(s) for s in symbols]
+    p = subprocess.run(
+        ["sudo", "systemctl", action, *services],
+        capture_output=True,
+        text=True,
+    )
+    out = (p.stdout or "") + (p.stderr or "")
+    return p.returncode, out.strip()
+
+
 ONE_HOUR = 3600
+grid = None  # ensure global exists
+
+
+# ============================
+# TELEGRAM COMMAND HANDLER
+# ============================
 
 async def handle_command(text: str):
     global grid
@@ -31,13 +60,21 @@ async def handle_command(text: str):
         return
 
     parts = t.split()
-    cmd = parts[0].lower().split("@")[0]  # handles /start@BotName
+    cmd = parts[0].lower().split("@")[0]
 
-    # ---- Basic help ----
+    # ---- HELP ----
     if cmd in ("/start", "/help"):
-        from notifier import notify
         await notify(
             "✅ SignalBot control is live.\n\n"
+            "Service Control:\n"
+            "/status\n"
+            "/start_all\n"
+            "/stop_all\n"
+            "/restart_all\n\n"
+            "Single Ticker:\n"
+            "/start BTC|ETH|SOL|JUP|HYPE\n"
+            "/stop BTC|ETH|SOL|JUP|HYPE\n"
+            "/restart BTC|ETH|SOL|JUP|HYPE\n\n"
             "Grid Commands:\n"
             "/grid_start SYMBOL lower upper grids usd_per_order\n"
             "/grid_stop SYMBOL\n"
@@ -46,22 +83,57 @@ async def handle_command(text: str):
         )
         return
 
-    # ---- Grid not enabled on this instance ----
-    if grid is None:
-        await notify(f"{SYMBOL}: Grid not enabled on this bot.")
+    # ---- SERVICE STATUS ----
+    if cmd == "/status":
+        lines = []
+        for s in ALL_SYMBOLS:
+            p = subprocess.run(["systemctl", "is-active", _svc_name(s)],
+                               capture_output=True, text=True)
+            lines.append(f"{s}: {p.stdout.strip()}")
+        await notify("\n".join(lines))
         return
 
-    # ---- Require SYMBOL argument ----
+    # ---- ALL SERVICE ACTIONS ----
+    if cmd in ("/start_all", "/stop_all", "/restart_all"):
+        action = cmd.replace("_all", "").replace("/", "")
+        rc, out = _run_systemctl(action, ALL_SYMBOLS)
+        if rc == 0:
+            await notify(f"✅ {action.upper()} ALL OK")
+        else:
+            await notify(f"⚠️ {action.upper()} ALL failed:\n{out[:1500]}")
+        return
+
+    # ---- SINGLE SERVICE ACTION ----
+    if cmd in ("/start", "/stop", "/restart"):
+        if len(parts) < 2:
+            await notify("Usage: /start BTC (or /start_all)")
+            return
+
+        sym = parts[1].upper()
+        if sym not in ALL_SYMBOLS:
+            await notify(f"Unknown symbol: {sym}")
+            return
+
+        action = cmd.replace("/", "")
+        rc, out = _run_systemctl(action, [sym])
+        if rc == 0:
+            await notify(f"✅ {action.upper()} {sym} OK")
+        else:
+            await notify(f"⚠️ {action.upper()} {sym} failed:\n{out[:1500]}")
+        return
+
+    # ---- GRID COMMANDS (UNCHANGED LOGIC) ----
+    if grid is None:
+        return
+
     if len(parts) < 2:
         return
 
     target_symbol = parts[1].upper()
 
-    # Only respond if command matches this instance
     if target_symbol != SYMBOL:
         return
 
-    # ---- Grid Commands ----
     if cmd == "/grid_start":
         if len(parts) < 6:
             await notify("Usage: /grid_start SYMBOL lower upper grids usd_per_order")
@@ -71,7 +143,6 @@ async def handle_command(text: str):
         upper = float(parts[3])
         grids = int(parts[4])
         usd = float(parts[5])
-
         await grid.start(GridParams(lower, upper, grids, usd))
 
     elif cmd == "/grid_stop":
