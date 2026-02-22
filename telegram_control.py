@@ -1,5 +1,7 @@
 import asyncio
 import httpx
+import os
+import json
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from logger import log
@@ -17,6 +19,24 @@ def _chat_ok(msg: dict) -> bool:
     except Exception:
         return False
 
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
+
+def load_tg_offset() -> int:
+    try:
+        with open(TELEGRAM_OFFSET_FILE, "r") as f:
+            return int(json.load(f).get("last_update_id", 0))
+    except Exception:
+        return 0
+
+def save_tg_offset(last_update_id: int) -> None:
+    try:
+        tmp = TELEGRAM_OFFSET_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_update_id": int(last_update_id)}, f)
+        os.replace(tmp, TELEGRAM_OFFSET_FILE)
+    except Exception:
+        pass
+
 
 async def telegram_poll_commands(on_command, poll_error_sleep_s: int = 2):
     """
@@ -28,7 +48,8 @@ async def telegram_poll_commands(on_command, poll_error_sleep_s: int = 2):
         log({"event": "telegram_control_disabled"})
         return
 
-    offset = None
+    last_id = load_tg_offset()
+    offset = (last_id + 1) if last_id else None
     timeout = 30  # long-poll duration
 
     async with httpx.AsyncClient(timeout=timeout + 10) as client:
@@ -47,6 +68,7 @@ async def telegram_poll_commands(on_command, poll_error_sleep_s: int = 2):
 
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
+                    save_tg_offset(upd["update_id"])
 
                     msg = upd.get("message") or upd.get("edited_message")
                     if not msg:
