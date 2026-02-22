@@ -51,6 +51,23 @@ grid = None  # ensure global exists
 # ============================
 # TELEGRAM COMMAND HANDLER
 # ============================
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
+
+def load_tg_offset() -> int:
+    try:
+        with open(TELEGRAM_OFFSET_FILE, "r") as f:
+            return int(json.load(f).get("last_update_id", 0))
+    except Exception:
+        return 0
+
+def save_tg_offset(last_update_id: int):
+    try:
+        tmp = TELEGRAM_OFFSET_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_update_id": int(last_update_id)}, f)
+        os.replace(tmp, TELEGRAM_OFFSET_FILE)
+    except Exception:
+        pass
 
 async def handle_command(text: str):
     global grid
