@@ -161,7 +161,7 @@ async def handle_command(text: str):
 ATR_LEN = 14
 
 RETEST_BUF_ATR = 0.30      # retest buffer = ATR * 0.30
-ACCEPT_BARS = 1            # acceptance closes after retest
+ACCEPT_BARS = 2            # acceptance closes after retest
 
 TP1_R_MULT = 1.0
 TP1_PARTIAL_PCT = 0.30     # paper bookkeeping only (signal-only bot)
