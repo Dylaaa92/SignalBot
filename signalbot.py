@@ -5,6 +5,7 @@ import httpx
 import websockets
 import subprocess
 import os
+import uuid
 
 from grid_engine import GridBot, GridParams
 from telegram_control import telegram_poll_commands
@@ -21,6 +22,7 @@ from indicators import ema
 from pivots import last_confirmed_swing_low, last_confirmed_swing_high
 from logger import log
 from notifier import notify
+from journal import Journal
 from trade_events import append_event, new_trade_id
 
 
@@ -37,12 +39,10 @@ def _run_systemctl(action: str, symbols: list[str]):
     services = [_svc_name(s) for s in symbols]
     p = subprocess.run(
         ["sudo", "systemctl", action, *services],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
     out = (p.stdout or "") + (p.stderr or "")
     return p.returncode, out.strip()
-
 
 ONE_HOUR = 3600
 grid = None  # ensure global exists
@@ -51,6 +51,7 @@ grid = None  # ensure global exists
 # ============================
 # TELEGRAM COMMAND HANDLER
 # ============================
+
 TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
 
 def load_tg_offset() -> int:
@@ -71,11 +72,9 @@ def save_tg_offset(last_update_id: int):
 
 async def handle_command(text: str):
     global grid
-
     t = (text or "").strip()
     if not t:
         return
-
     parts = t.split()
     cmd = parts[0].lower().split("@")[0]
 
@@ -104,8 +103,7 @@ async def handle_command(text: str):
     if cmd == "/status":
         lines = []
         for s in ALL_SYMBOLS:
-            p = subprocess.run(["systemctl", "is-active", _svc_name(s)],
-                               capture_output=True, text=True)
+            p = subprocess.run(["systemctl", "is-active", _svc_name(s)], capture_output=True, text=True)
             lines.append(f"{s}: {p.stdout.strip()}")
         await notify("\n".join(lines))
         return
@@ -125,12 +123,10 @@ async def handle_command(text: str):
         if len(parts) < 2:
             await notify("Usage: /start BTC (or /start_all)")
             return
-
         sym = parts[1].upper()
         if sym not in ALL_SYMBOLS:
             await notify(f"Unknown symbol: {sym}")
             return
-
         action = cmd.replace("/", "")
         rc, out = _run_systemctl(action, [sym])
         if rc == 0:
@@ -147,7 +143,6 @@ async def handle_command(text: str):
         return
 
     target_symbol = parts[1].upper()
-
     if target_symbol != SYMBOL:
         return
 
@@ -155,7 +150,6 @@ async def handle_command(text: str):
         if len(parts) < 6:
             await notify("Usage: /grid_start SYMBOL lower upper grids usd_per_order")
             return
-
         lower = float(parts[2])
         upper = float(parts[3])
         grids = int(parts[4])
@@ -175,11 +169,10 @@ async def handle_command(text: str):
 # ============================
 # Strategy params (FINAL LOGIC)
 # ============================
-ATR_LEN = 14
 
+ATR_LEN = 14
 RETEST_BUF_ATR = 0.30      # retest buffer = ATR * 0.30
 ACCEPT_BARS = 2            # acceptance closes after retest
-
 TP1_R_MULT = 1.0
 TP1_PARTIAL_PCT = 0.30     # paper bookkeeping only (signal-only bot)
 
@@ -239,8 +232,7 @@ def crossed_up(prev_fast, prev_slow, fast, slow) -> bool:
 
 
 def safe_append(event: dict):
-    """
-    Never let a filesystem write crash the bot.
+    """ Never let a filesystem write crash the bot.
     Logs an error to bot logger instead.
     """
     try:
@@ -250,57 +242,45 @@ def safe_append(event: dict):
 
 
 class StructureState:
-    """
-    BOS -> Retest -> Accept state (per symbol instance).
+    """ BOS -> Retest -> Accept state (per symbol instance).
     Stores BOS level and the swing anchor at time of BOS to build stop later.
     """
     def __init__(self):
-        self.direction = None  # "LONG" / "SHORT" or None
-
+        self.direction = None
         self.bosLevel = None
         self.waitingRetest = False
         self.retestRef = None
         self.accCount = 0
-
-        # Swing anchors captured at BOS time (so stop doesn't drift later)
-        self.bosSwingLow = None    # for long stop
-        self.bosSwingHigh = None   # for short stop
+        self.bosSwingLow = None
+        self.bosSwingHigh = None
 
     def reset(self):
-        self.__init__()
+        self.direction = None
+        self.bosLevel = None
+        self.waitingRetest = False
+        self.retestRef = None
+        self.accCount = 0
+        self.bosSwingLow = None
+        self.bosSwingHigh = None
 
 
 class SignalTradeState:
-    """
-    Signal-only state machine:
-
-    PRE_TP1: track entry, stop, R, TP1
-    RUNNER: after TP1, manage runner stop (BE/structure/ATR), EMA cross exit, time stop
-    """
     def __init__(self):
         self.active = False
-        self.phase = None         # "PRE_TP1" or "RUNNER"
-        self.side = None          # "LONG" / "SHORT"
-
+        self.phase = None  # PRE_TP1, RUNNER
+        self.side = None
         self.trade_id = None
         self.entry_t = None
-
         self.entry = None
         self.stop_init = None
         self.R = None
         self.tp1 = None
-
-        # TP1 bookkeeping
         self.tp1_sent = False
         self.tp1_t = None
-
-        # Runner tracking
-        self.struct_stop = None
-        self.atr_stop = None
         self.highest_high_since_tp1 = None
         self.lowest_low_since_tp1 = None
-
-        # EMA cross tracking (for forced runner exit)
+        self.struct_stop = None
+        self.atr_stop = None
         self.prev_efast5 = None
         self.prev_eslow5 = None
 
@@ -308,28 +288,37 @@ class SignalTradeState:
         self.__init__()
 
 
-async def bootstrap_candles(symbol: str, tf_seconds: int, limit: int = 300):
-    interval = "5m"
+async def bootstrap_candles(symbol: str, tf_sec: int, limit=300):
+    """
+    Bootstrap from hyperliquid REST-like endpoint (via Info API endpoint through httpx).
+    Uses the same candle format as CandleBuilder.
+    """
+    # NOTE: This is your existing bootstrap; leaving it intact.
+    # If you want volume/VWAP/POC later, this is where we'd extend.
     url = "https://api.hyperliquid.xyz/info"
+    now = int(time.time() * 1000)
+    start = now - (limit * tf_sec * 1000)
+
     payload = {
         "type": "candleSnapshot",
         "req": {
             "coin": symbol,
-            "interval": interval,
-            "startTime": int((time.time() - limit * tf_seconds) * 1000),
-            "endTime": int(time.time() * 1000),
-        }
+            "interval": f"{tf_sec // 60}m" if tf_sec < 3600 else "1h",
+            "startTime": start,
+            "endTime": now,
+        },
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, json=payload)
         r.raise_for_status()
-        candles = r.json()
+        data = r.json()
 
     out = []
-    for c in candles:
+    for c in data:
+        t = int(c["t"] / 1000)
         out.append({
-            "t": int(c["t"] // 1000),
+            "t": t - (t % tf_sec),
             "o": float(c["o"]),
             "h": float(c["h"]),
             "l": float(c["l"]),
@@ -367,13 +356,18 @@ async def main():
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
     await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
 
-	grid = None
+    # --- journaling session ---
+    session_id = os.getenv("SESSION_ID", str(uuid.uuid4())[:8])
+    journal = Journal(session_id=session_id)
+    log({"event": "session_started", "session_id": session_id, "symbol": SYMBOL})
 
-	if os.getenv("GRID_ENABLED", "0") == "1":
-	    grid = GridBot(SYMBOL, ENV)
-	    asyncio.create_task(grid.loop())
+    # --- optional grid bot ---
+    global grid
+    grid = None
+    if os.getenv("GRID_ENABLED", "0") == "1":
+        grid = GridBot(SYMBOL, ENV)
+        asyncio.create_task(grid.loop())
 
-	
     last_hb = 0
 
     while True:
@@ -404,6 +398,22 @@ async def main():
                     if closed["t"] == last_candle_t:
                         continue
                     last_candle_t = closed["t"]
+
+                    # --- journal: 5m snapshot (OHLC only; volume/POC/VWAP not available from mids stream) ---
+                    journal.write_snapshot({
+                        "symbol": SYMBOL,
+                        "tf": "5m",
+                        "open": closed.get("o"),
+                        "high": closed.get("h"),
+                        "low": closed.get("l"),
+                        "close": closed.get("c"),
+                        "volume": "",
+                        "ema9": "",
+                        "ema21": "",
+                        "vwap": "",
+                        "poc": "",
+                        "rsi": "",
+                    })
 
                     # build 1h from 5m closes
                     candle_1h.update(closed["t"] + TF_SECONDS, closed["c"])
@@ -717,7 +727,7 @@ async def main():
                                     structure.retestRef = structure.bosLevel
                                     structure.accCount = 0
 
-                        # Acceptance closes (ACCEPT_BARS = 1)
+                        # Acceptance closes
                         if structure.waitingRetest and structure.retestRef is not None:
                             if structure.direction == "LONG":
                                 structure.accCount = structure.accCount + 1 if closed["c"] > structure.retestRef else 0
@@ -725,6 +735,139 @@ async def main():
                                 structure.accCount = structure.accCount + 1 if closed["c"] < structure.retestRef else 0
 
                         accepted = structure.waitingRetest and structure.retestRef is not None and structure.accCount >= ACCEPT_BARS
+
+                        # --- journal: decision report (rule-based) ---
+                        # Determine working direction even before acceptance
+                        working_dir = structure.direction
+                        if working_dir is None:
+                            if bosUp:
+                                working_dir = "LONG"
+                            elif bosDown:
+                                working_dir = "SHORT"
+
+                        gates_required = ["bias_1h", "ema_trend_5m", "bos", "retest", "acceptance"]
+                        gates_passed = []
+                        gates_failed = []
+
+                        # Gate: BOS (satisfied once we're in BOS->retest state)
+                        bos_gate = bool(structure.waitingRetest)
+                        (gates_passed if bos_gate else gates_failed).append("bos")
+
+                        # Gate: Retest
+                        retest_gate = bool(structure.retestRef is not None)
+                        (gates_passed if retest_gate else gates_failed).append("retest")
+
+                        # Gate: Acceptance
+                        acc_gate = bool(accepted)
+                        (gates_passed if acc_gate else gates_failed).append("acceptance")
+
+                        # Gates: bias + ema trend depend on direction
+                        if working_dir == "LONG":
+                            (gates_passed if biasLong else gates_failed).append("bias_1h")
+                            (gates_passed if emaTrendLong else gates_failed).append("ema_trend_5m")
+                        elif working_dir == "SHORT":
+                            (gates_passed if biasShort else gates_failed).append("bias_1h")
+                            (gates_passed if emaTrendShort else gates_failed).append("ema_trend_5m")
+                        else:
+                            gates_failed.extend(["bias_1h", "ema_trend_5m"])
+
+                        # Action classification
+                        if sig.active:
+                            action = "MANAGE"
+                        elif accepted and working_dir == "LONG" and biasLong and emaTrendLong:
+                            action = "ENTER_LONG"
+                        elif accepted and working_dir == "SHORT" and biasShort and emaTrendShort:
+                            action = "ENTER_SHORT"
+                        elif structure.waitingRetest:
+                            action = "WATCH"
+                        else:
+                            action = "NO_TRADE"
+
+                        # Risk plan (only filled on ENTER_*)
+                        entry_px = closed["c"] if action in ("ENTER_LONG", "ENTER_SHORT") else ""
+                        stop_px = ""
+                        tp1_px = ""
+                        rr_to_tp1 = ""
+                        inv_px = ""
+
+                        if action == "ENTER_LONG" and structure.bosSwingLow is not None:
+                            stop_px = float(structure.bosSwingLow) - (a * 0.10)
+                            inv_px = stop_px
+                            R_tmp = float(entry_px) - stop_px
+                            if R_tmp > 0:
+                                tp1_px = float(entry_px) + TP1_R_MULT * R_tmp
+                                rr_to_tp1 = 1.0
+                        elif action == "ENTER_SHORT" and structure.bosSwingHigh is not None:
+                            stop_px = float(structure.bosSwingHigh) + (a * 0.10)
+                            inv_px = stop_px
+                            R_tmp = stop_px - float(entry_px)
+                            if R_tmp > 0:
+                                tp1_px = float(entry_px) - TP1_R_MULT * R_tmp
+                                rr_to_tp1 = 1.0
+
+                        confidence = int(100 * (len(set(gates_passed)) / max(1, len(set(gates_required)))))
+
+                        report = {
+                            "symbol": SYMBOL,
+                            "mode": "signal_only",
+                            "strategy": "BOS_RETEST_ACCEPT_V1",
+                            "data_fresh_ms": int((time.time() - (closed["t"] + TF_SECONDS)) * 1000),
+                            "px_last": closed["c"],
+                            "spread_bps": "",
+                            "vwap_5m": "",
+                            "poc_5m": "",
+                            "vwap_1h": "",
+                            "poc_1h": "",
+                            "ema9_1h": efast1,
+                            "ema21_1h": eslow1,
+                            "bias_1h": "LONG" if biasLong else ("SHORT" if biasShort else "NEUTRAL"),
+                            "bias_reason": "ema9>ema21" if biasLong else ("ema9<ema21" if biasShort else "flat"),
+                            "rsi_1h": "",
+                            "bos_dir": "UP" if bosUp else ("DOWN" if bosDown else "NONE"),
+                            "bos_level": structure.bosLevel or "",
+                            "retest_level": structure.retestRef or "",
+                            "retest_state": "TOUCHED" if structure.retestRef is not None else ("ARMED" if structure.waitingRetest else "NONE"),
+                            "acceptance_bars": structure.accCount or 0,
+                            "acceptance_required": ACCEPT_BARS,
+                            "acceptance_state": "PASS" if accepted else ("FAIL" if structure.retestRef is not None else "NA"),
+                            "vol_5m": "",
+                            "vol_ma_20": "",
+                            "vol_state": "NA",
+                            "vol_reason": "",
+                            "entry_plan": "LIMIT" if action in ("ENTER_LONG", "ENTER_SHORT") else "NONE",
+                            "entry_px": entry_px,
+                            "invalidation_px": inv_px,
+                            "stop_px": stop_px,
+                            "tp1_px": tp1_px,
+                            "runner_trail": "ATR+STRUCTURE",
+                            "rr_to_tp1": rr_to_tp1,
+                            "gates_required": gates_required,
+                            "gates_passed": sorted(set(gates_passed)),
+                            "gates_failed": sorted(set(gates_failed)),
+                            "action": action,
+                            "confidence": confidence,
+                            "notes": "",
+                        }
+
+                        journal.write_decision(report)
+
+                        # If we're signaling an entry, also write a trade-intent row (paper journal)
+                        if action in ("ENTER_LONG", "ENTER_SHORT"):
+                            journal.write_trade({
+                                "symbol": SYMBOL,
+                                "side": "LONG" if action == "ENTER_LONG" else "SHORT",
+                                "qty": "",
+                                "entry_px": entry_px,
+                                "stop_px": stop_px,
+                                "tp1_px": tp1_px,
+                                "exit_px": "",
+                                "pnl_usd": "",
+                                "pnl_r": "",
+                                "reason": "|".join(sorted(set(gates_passed))),
+                                "order_id": "",
+                                "fill_id": "",
+                                "mode": "signal_only",
+                            })
 
                         # ============================
                         # 3) Entry (signal-only) + init TP1 + JSON ENTER event
@@ -843,4 +986,3 @@ async def run_all():
 
 if __name__ == "__main__":
     asyncio.run(run_all())
-
