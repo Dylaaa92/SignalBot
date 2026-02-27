@@ -120,6 +120,10 @@ async def swing_loop():
     last_15m_close_count = 0
     last_signal_key = None
 
+    state = {"phase": "IDLE"}
+    last_status_15m = 0
+    STATUS_EVERY_N_15M = 4  # 4 = once per hour
+
     # -----------------------
     # Bootstrap history
     # -----------------------
@@ -185,42 +189,48 @@ async def swing_loop():
                 f"[SWING][STATUS] {SYMBOL} | 15m={len(c15['close'])} 1h={len(c1h['close'])} 4h={len(c4h['close'])}"
             )
 
-            sig = generate_swing_signal(
+            sig, state, dbg = generate_swing_signal(
                 symbol=SYMBOL,
                 c4h=c4h,
                 c1h=c1h,
                 c15m=c15,
+                state=state,
                 pivot_len=PIVOT_LEN,
                 atr_len=ATR_LEN,
                 atr_buf_mult=ATR_BUF_MULT,
                 tp_r=TP_R,
-                require_breakout_candle=REQUIRE_BREAKOUT_CANDLE,
             )
-
-            if sig:
-                key = f"{sig.symbol}:{sig.side}:{round(sig.entry,4)}"
-                if key == last_signal_key:
-                    continue
-
-                last_signal_key = key
-
+            
+            # Throttled status (hourly)
+            if len(c15["close"]) >= last_status_15m + STATUS_EVERY_N_15M:
+                last_status_15m = len(c15["close"])
                 await notify(
-                    f"[SWING SIGNAL] {sig.symbol} {sig.side}\n"
-                    f"Entry: {sig.entry:.4f}\n"
-                    f"Stop: {sig.stop:.4f}\n"
-                    f"TP1: {sig.tp1:.4f}"
+                    f"[SWING][STATUS] {SYMBOL} phase={state.get('phase')} bias={dbg.get('bias_4h')} "
+                    f"1h_close={dbg.get('last_1h_close')} sh={dbg.get('swing_high')} sl={dbg.get('swing_low')}"
                 )
-
-                log(
-                    {
-                        "event": "swing_signal",
-                        "symbol": sig.symbol,
-                        "side": sig.side,
-                        "entry": sig.entry,
-                        "stop": sig.stop,
-                        "tp1": sig.tp1,
-                    }
-                )
+            
+            if sig:
+                key = f"{sig.symbol}:{sig.side}:{round(sig.entry,4)}:{round(sig.stop,4)}"
+                if key != last_signal_key:
+                    last_signal_key = key
+                    await notify(
+                        f"[SWING SIGNAL] {sig.symbol} {sig.side}\n"
+                        f"Reason: {sig.reason}\n"
+                        f"Entry: {sig.entry:.4f}\n"
+                        f"Stop: {sig.stop:.4f}\n"
+                        f"TP1: {sig.tp1:.4f}"
+                    )
+                    log(
+                        {
+                            "event": "swing_signal",
+                            "symbol": sig.symbol,
+                            "side": sig.side,
+                            "entry": sig.entry,
+                            "stop": sig.stop,
+                            "tp1": sig.tp1,
+                            "phase": state.get("phase"),
+                        }
+                    )
 
 
 def main():
