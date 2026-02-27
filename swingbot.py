@@ -15,11 +15,7 @@ from strategies.swing_strategy import generate_swing_signal
 SYMBOL = os.getenv("SYMBOL", "BTC")
 
 TF_5M = 300
-
-# How much history to pull on startup
 BOOTSTRAP_DAYS = int(os.getenv("SWING_BOOTSTRAP_DAYS", "5"))
-
-# Status throttling: 4 x 15m = 1 hour
 STATUS_EVERY_N_15M = int(os.getenv("SWING_STATUS_EVERY_N_15M", "4"))
 
 
@@ -62,12 +58,6 @@ def aggregate_from_5m(c5m: list, group_n: int) -> Dict[str, list]:
 
 
 async def bootstrap_5m_candles(symbol: str, limit_days: int = 5) -> list:
-    """
-    Prefill N days of 5m candles so SwingBot is signal-ready immediately.
-    Hyperliquid candleSnapshot endpoint:
-      POST https://api.hyperliquid.xyz/info
-      { type: "candleSnapshot", req: { coin, interval, startTime, endTime } }
-    """
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - (limit_days * 24 * 60 * 60 * 1000)
 
@@ -107,14 +97,7 @@ async def bootstrap_5m_candles(symbol: str, limit_days: int = 5) -> list:
     return candles
 
 
-def _unpack_strategy_result(
-    result: Any,
-) -> Tuple[Optional[Any], Dict[str, Any], Dict[str, Any]]:
-    """
-    Supports both:
-      - sig
-      - (sig, state, debug)
-    """
+def _unpack_strategy_result(result: Any):
     if isinstance(result, tuple) and len(result) == 3:
         sig, state, dbg = result
         return sig, (state or {}), (dbg or {})
@@ -124,7 +107,6 @@ def _unpack_strategy_result(
 async def swing_loop():
     print(f"[SWING] starting {SYMBOL} env={ENV}")
 
-    # Clear Telegram message: ONLINE != signal
     try:
         await notify(f"[SWING] ONLINE {SYMBOL} ({ENV}) - this is NOT a trade signal.")
         print("[SWING] online notify sent")
@@ -133,20 +115,13 @@ async def swing_loop():
 
     cb5 = CandleBuilder(TF_5M)
 
-    # Strategy state (works if your swing_strategy returns/uses it)
     state: Dict[str, Any] = {"phase": "IDLE"}
     last_phase = state.get("phase")
     last_signal_key = None
-
-    # Evaluate only when a new 15m candle closes
     last_15m_close_count = 0
-
-    # Status throttling
     last_status_15m = 0
 
-    # -----------------------
     # Bootstrap history
-    # -----------------------
     try:
         hist = await bootstrap_5m_candles(SYMBOL, limit_days=BOOTSTRAP_DAYS)
         cb5.candles.extend(hist)
@@ -154,145 +129,137 @@ async def swing_loop():
         print(msg)
         await notify(msg)
     except Exception as e:
-        msg = f"[SWING] Bootstrap FAILED {SYMBOL}: {e}"
-        print(msg)
+        print(f"[SWING] Bootstrap FAILED {SYMBOL}: {e}")
+
+    # Websocket reconnect loop
+    while True:
         try:
-            await notify(msg)
-        except Exception:
-            pass
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                print(f"[SWING] ws connected {WS_URL}")
 
-    # -----------------------
-    # Live WebSocket
-    # -----------------------
-    async with websockets.connect(WS_URL) as ws:
-        print(f"[SWING] ws connected {WS_URL}")
+                sub = {"method": "subscribe", "subscription": {"type": "allMids"}}
+                await ws.send(json.dumps(sub))
+                print("[SWING] ws subscribed")
 
-        sub = {"method": "subscribe", "subscription": {"type": "allMids"}}
-        await ws.send(json.dumps(sub))
-        print("[SWING] ws subscribed")
+                while True:
+                    msg = await ws.recv()
 
-        while True:
-            msg = await ws.recv()
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
 
-            try:
-                data = json.loads(msg)
-            except Exception:
-                continue
+                    if data.get("channel") != "allMids":
+                        continue
 
-            if data.get("channel") != "allMids":
-                continue
+                    mids = data.get("data", {}).get("mids")
+                    if not isinstance(mids, dict):
+                        continue
 
-            mids = data.get("data", {}).get("mids")
-            if not isinstance(mids, dict):
-                continue
+                    if SYMBOL not in mids:
+                        continue
 
-            if SYMBOL not in mids:
-                continue
+                    try:
+                        price = float(mids[SYMBOL])
+                    except Exception:
+                        continue
 
-            try:
-                price = float(mids[SYMBOL])
-            except Exception:
-                continue
+                    cb5.update(time.time(), price)
 
-            cb5.update(time.time(), price)
+                    if len(cb5.candles) < 96:
+                        continue
 
-            # Build aggregates from closed 5m candles
-            if len(cb5.candles) < 48 * 2:  # ~8 hours minimum safeguard
-                continue
+                    c15 = aggregate_from_5m(cb5.candles, 3)
+                    if not c15["close"]:
+                        continue
 
-            c15 = aggregate_from_5m(cb5.candles, 3)
-            if not c15["close"]:
-                continue
+                    if len(c15["close"]) == last_15m_close_count:
+                        continue
+                    last_15m_close_count = len(c15["close"])
 
-            # Run only on NEW 15m close
-            if len(c15["close"]) == last_15m_close_count:
-                continue
-            last_15m_close_count = len(c15["close"])
+                    c1h = aggregate_from_5m(cb5.candles, 12)
+                    c4h = aggregate_from_5m(cb5.candles, 48)
+                    if not c1h["close"] or not c4h["close"]:
+                        continue
 
-            c1h = aggregate_from_5m(cb5.candles, 12)
-            c4h = aggregate_from_5m(cb5.candles, 48)
-            if not c1h["close"] or not c4h["close"]:
-                continue
+                    try:
+                        result = generate_swing_signal(
+                            symbol=SYMBOL,
+                            c4h=c4h,
+                            c1h=c1h,
+                            c15m=c15,
+                            state=state,
+                        )
+                    except TypeError:
+                        result = generate_swing_signal(
+                            symbol=SYMBOL,
+                            c4h=c4h,
+                            c1h=c1h,
+                            c15m=c15,
+                        )
 
-            # Call strategy (supports both old and new signatures)
-            try:
-                result = generate_swing_signal(
-                    symbol=SYMBOL,
-                    c4h=c4h,
-                    c1h=c1h,
-                    c15m=c15,
-                    state=state,  # if strategy doesn't accept it, we'll catch TypeError below
-                )
-            except TypeError:
-                # Strategy might not accept state param
-                result = generate_swing_signal(
-                    symbol=SYMBOL,
-                    c4h=c4h,
-                    c1h=c1h,
-                    c15m=c15,
-                )
+                    sig, new_state, dbg = _unpack_strategy_result(result)
+                    if new_state:
+                        state = new_state
 
-            sig, new_state, dbg = _unpack_strategy_result(result)
-            if new_state:
-                state = new_state
+                    phase = state.get("phase", "IDLE")
 
-            phase = state.get("phase", "IDLE")
+                    should_status = False
+                    if len(c15["close"]) >= last_status_15m + STATUS_EVERY_N_15M:
+                        should_status = True
+                        last_status_15m = len(c15["close"])
+                    if phase != last_phase:
+                        should_status = True
+                        last_phase = phase
 
-            # STATUS: hourly OR on phase change
-            should_status = False
-            if len(c15["close"]) >= last_status_15m + STATUS_EVERY_N_15M:
-                should_status = True
-                last_status_15m = len(c15["close"])
-            if phase != last_phase:
-                should_status = True
-                last_phase = phase
+                    if should_status:
+                        s = f"[SWING][STATUS] {SYMBOL} phase={phase}"
+                        print(s)
+                        try:
+                            await notify(s)
+                        except:
+                            pass
 
-            if should_status:
-                s = (
-                    f"[SWING][STATUS] {SYMBOL} phase={phase} "
-                    f"bias={dbg.get('bias_4h')} "
-                    f"1h_close={dbg.get('last_1h_close')} "
-                    f"sh={dbg.get('swing_high')} sl={dbg.get('swing_low')}"
-                )
-                print(s)
-                try:
-                    await notify(s)
-                except Exception as e:
-                    print(f"[SWING] status notify failed: {e}")
+                    if sig:
+                        side = getattr(sig, "side", None) or sig.get("side")
+                        entry = getattr(sig, "entry", None) or sig.get("entry")
+                        stop = getattr(sig, "stop", None) or sig.get("stop")
+                        tp1 = getattr(sig, "tp1", None) or sig.get("tp1")
+                        reason = getattr(sig, "reason", None) or sig.get("reason", "")
 
-            # SIGNAL
-            if sig:
-                side = getattr(sig, "side", None) or sig.get("side")
-                entry = getattr(sig, "entry", None) or sig.get("entry")
-                stop = getattr(sig, "stop", None) or sig.get("stop")
-                tp1 = getattr(sig, "tp1", None) or sig.get("tp1")
-                reason = getattr(sig, "reason", None) or sig.get("reason", "")
+                        key = f"{SYMBOL}:{side}:{round(float(entry),4)}:{round(float(stop),4)}"
+                        if key != last_signal_key:
+                            last_signal_key = key
 
-                key = f"{SYMBOL}:{side}:{round(float(entry),4)}:{round(float(stop),4)}"
-                if key == last_signal_key:
-                    continue
-                last_signal_key = key
+                            msg = (
+                                f"[SWING SIGNAL] {SYMBOL} {side}\n"
+                                f"Reason: {reason}\n"
+                                f"Entry: {float(entry):.4f}\n"
+                                f"Stop: {float(stop):.4f}\n"
+                                f"TP1: {float(tp1):.4f}"
+                            )
+                            print(msg)
+                            await notify(msg)
 
-                msg = (
-                    f"[SWING SIGNAL] {SYMBOL} {side}\n"
-                    f"Reason: {reason}\n"
-                    f"Entry: {float(entry):.4f}\n"
-                    f"Stop: {float(stop):.4f}\n"
-                    f"TP1: {float(tp1):.4f}"
-                )
-                print(msg)
-                await notify(msg)
-                log(
-                    {
-                        "event": "swing_signal",
-                        "symbol": SYMBOL,
-                        "side": side,
-                        "entry": float(entry),
-                        "stop": float(stop),
-                        "tp1": float(tp1),
-                        "phase": phase,
-                    }
-                )
+                            log(
+                                {
+                                    "event": "swing_signal",
+                                    "symbol": SYMBOL,
+                                    "side": side,
+                                    "entry": float(entry),
+                                    "stop": float(stop),
+                                    "tp1": float(tp1),
+                                    "phase": phase,
+                                }
+                            )
+
+        except Exception as e:
+            print(f"[SWING] ws error/reconnect: {repr(e)}")
+            await asyncio.sleep(3)
 
 
 def main():
