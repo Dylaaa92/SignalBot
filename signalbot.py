@@ -356,6 +356,7 @@ async def main():
     log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
     await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
 
+
     # --- journaling session ---
     session_id = os.getenv("SESSION_ID", str(uuid.uuid4())[:8])
     journal = Journal(session_id=session_id)

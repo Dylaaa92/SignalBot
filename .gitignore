@@ -14,3 +14,11 @@ venv/
 # OS / editor
 .DS_Store
 .vscode/
+# Local artifacts
+*.bak.*
+*.fixbak.*
+telegram_offset*.json
+stats.py
+trades/
+__pycache__/
+*.pyc

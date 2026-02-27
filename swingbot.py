@@ -1,95 +1,150 @@
-# swingbot.py
+import asyncio
+import json
 import os
 import time
+import websockets
 
 from notifier import notify
 from logger import log
-
+from config import WS_URL, ENV
 from strategies.swing_strategy import generate_swing_signal
 
 SYMBOL = os.getenv("SYMBOL", "BTC")
 
-# ---- you already have something like this in signalbot.py ----
-# You can lift these from your existing bot:
-# - WS connection
-# - 5m candle builder
-# - historical bootstrap (if you do it)
-# For now, this file focuses on how to evaluate swing logic cleanly.
+TF_5M = 300
+TF_15M = 900
+TF_1H = 3600
+TF_4H = 14400
 
-def aggregate_from_5m(c5m, group_n: int):
-    """
-    Aggregate 5m candles into higher TF.
-    c5m is list of dicts: {"t":..., "open":..., "high":..., "low":..., "close":..., "volume":...}
-    Returns arrays dict with open/high/low/close/volume.
-    """
-    out = {"open": [], "high": [], "low": [], "close": [], "volume": []}
+PIVOT_LEN = 5
+ATR_LEN = 14
+ATR_BUF_MULT = 0.25
+TP_R = 1.0
+REQUIRE_BREAKOUT_CANDLE = True
+
+
+class CandleBuilder:
+    def __init__(self, tf_seconds):
+        self.tf = tf_seconds
+        self.current = None
+        self.candles = []
+
+    def _bucket(self, ts):
+        return int(ts // self.tf) * self.tf
+
+    def update(self, ts, price):
+        b = self._bucket(ts)
+        if self.current is None or self.current["t"] != b:
+            if self.current is not None:
+                self.candles.append(self.current)
+            self.current = {"t": b, "o": price, "h": price, "l": price, "c": price}
+        else:
+            self.current["h"] = max(self.current["h"], price)
+            self.current["l"] = min(self.current["l"], price)
+            self.current["c"] = price
+
+    def last_closed(self):
+        return self.candles[-1] if self.candles else None
+
+
+def aggregate_from_5m(c5m, group_n):
+    out = {"open": [], "high": [], "low": [], "close": []}
     total = len(c5m)
     usable = (total // group_n) * group_n
+
     if usable < group_n:
         return out
 
     for i in range(0, usable, group_n):
-        chunk = c5m[i:i+group_n]
-        out["open"].append(chunk[0]["open"])
-        out["close"].append(chunk[-1]["close"])
-        out["high"].append(max(x["high"] for x in chunk))
-        out["low"].append(min(x["low"] for x in chunk))
-        out["volume"].append(sum(x.get("volume", 0) for x in chunk))
+        chunk = c5m[i : i + group_n]
+        out["open"].append(chunk[0]["o"])
+        out["close"].append(chunk[-1]["c"])
+        out["high"].append(max(x["h"] for x in chunk))
+        out["low"].append(min(x["l"] for x in chunk))
+
     return out
 
-def main():
-    notify(f"🟦 SwingBot live for {SYMBOL} | 4H bias / 1H BOS(strict) / 15m entry")
 
-    last_signal_key = None  # dedupe per 15m close
+async def swing_loop():
+    print("[SWING] starting", SYMBOL)
+    await notify(f"[SWING] SwingBot live for {SYMBOL} ({ENV})")
+    print("[SWING] notify sent")
 
-    # TODO: replace with your actual 5m candle list and WS updates
-    c5m = []  # list of 5m candles dicts
+    cb5 = CandleBuilder(TF_5M)
 
-    while True:
-        # TODO: your WS loop updates c5m in real-time.
-        # We only *evaluate* when a 15m candle has just closed.
-        # If you already have an "on_candle_close(5m)" hook, use it.
+    async with websockets.connect(WS_URL) as ws:
+        print("[SWING] ws connected")
 
-        time.sleep(1)
+        sub = {"method": "subscribe", "subscription": {"type": "allMids"}}
+        await ws.send(json.dumps(sub))
+        print("[SWING] ws subscribed")
 
-        if len(c5m) < 48 * 60:  # rough: enough 5m bars to form meaningful 4H / pivots (adjust)
-            continue
+        while True:
+            msg = await ws.recv()
 
-        # Build higher TF candles from 5m
-        c15 = aggregate_from_5m(c5m, 3)
-        c1h = aggregate_from_5m(c5m, 12)
-        c4h = aggregate_from_5m(c5m, 48)
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
 
-        # Only evaluate once per new 15m close
-        # Use length of c15 as a proxy for "new 15m candle formed"
-        current_key = (len(c15["close"]),)
-        if current_key == last_signal_key:
-            continue
-        last_signal_key = current_key
+            if data.get("channel") != "allMids":
+                continue
 
-        sig = generate_swing_signal(
-            symbol=SYMBOL,
-            c4h=c4h,
-            c1h=c1h,
-            c15m=c15,
-            pivot_len=5,
-            atr_len=14,
-            atr_buf_mult=0.25,
-            tp_r=1.0,
-            require_breakout_candle=True,
-        )
+            mids = data.get("data", {}).get("mids")
+            if not isinstance(mids, dict):
+                continue
 
-        if sig:
-            msg = (
-                f"📣 SWING SIGNAL {sig.symbol}\n"
-                f"Side: {sig.side}\n"
-                f"Entry: {sig.entry:.4f}\n"
-                f"Stop: {sig.stop:.4f}\n"
-                f"TP1: {sig.tp1:.4f}\n"
-                f"{sig.reason}"
+            if SYMBOL not in mids:
+                continue
+
+            try:
+                price = float(mids[SYMBOL])
+            except Exception:
+                continue
+
+            cb5.update(time.time(), price)
+
+            if len(cb5.candles) < 48 * 5:
+                continue
+
+            c15 = aggregate_from_5m(cb5.candles, 3)
+            c1h = aggregate_from_5m(cb5.candles, 12)
+            c4h = aggregate_from_5m(cb5.candles, 48)
+
+            sig = generate_swing_signal(
+                symbol=SYMBOL,
+                c4h=c4h,
+                c1h=c1h,
+                c15m=c15,
+                pivot_len=PIVOT_LEN,
+                atr_len=ATR_LEN,
+                atr_buf_mult=ATR_BUF_MULT,
+                tp_r=TP_R,
+                require_breakout_candle=REQUIRE_BREAKOUT_CANDLE,
             )
-            notify(msg)
-            log("TRADE", {"event": "swing_signal", "symbol": sig.symbol, "side": sig.side, "entry": sig.entry, "stop": sig.stop, "tp1": sig.tp1})
+
+            if sig:
+                await notify(
+                    f"[SWING] {sig.symbol} {sig.side}\n"
+                    f"Entry: {sig.entry}\n"
+                    f"Stop: {sig.stop}\n"
+                    f"TP1: {sig.tp1}"
+                )
+                log(
+                    {
+                        "event": "swing_signal",
+                        "symbol": sig.symbol,
+                        "side": sig.side,
+                        "entry": sig.entry,
+                        "stop": sig.stop,
+                        "tp1": sig.tp1,
+                    }
+                )
+
+
+def main():
+    asyncio.run(swing_loop())
+
 
 if __name__ == "__main__":
     main()
