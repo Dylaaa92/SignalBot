@@ -21,6 +21,9 @@ class HL:
         self.info = Info(self.api_url, skip_ws=True)
         wallet = Account.from_key(self.secret_key)
         self.ex = Exchange(wallet, base_url=self.api_url, account_address=self.account_address)
+        
+    def user_state(self):
+        return self.info.user_state(self.account_address)
 
     def mid(self, coin: str) -> float:
         # You already subscribe to allMids, but this is useful as a fallback.
