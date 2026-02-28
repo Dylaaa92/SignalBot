@@ -14,12 +14,19 @@ WS_TESTNET = "wss://api.hyperliquid-testnet.xyz/ws"
 
 WS_URL = WS_MAINNET if ENV == "mainnet" else WS_TESTNET
 
+# Execution timeframe (default for legacy bot)
+TF_SECONDS = int(os.getenv("TF_SECONDS", "300"))  # 5m legacy
 
-# Execution timeframe
-TF_SECONDS = 300  # 5m
+# New multi-TF strategy timeframes
+EXEC_TF_SECONDS   = int(os.getenv("EXEC_TF_SECONDS", "900"))    # 15m
+STRUCT_TF_SECONDS = int(os.getenv("STRUCT_TF_SECONDS", "3600")) # 1h
+BIAS_TF_SECONDS   = int(os.getenv("BIAS_TF_SECONDS", "14400"))  # 4h
+
+TRADING_MODE = os.getenv("TRADING_MODE", "paper").lower()       # paper|live
+STRATEGY     = os.getenv("STRATEGY", "BOS_RETEST_ACCEPT_V1")    # or INTRADAY_SWING_V2
 
 # Risk
-RISK_USDT_PER_TRADE = 5.0
+RISK_USDT_PER_TRADE = float(os.getenv("RISK_USDT_PER_TRADE", "5.0"))
 DAILY_MAX_LOSS_USDT = 20.0
 MAX_CONSEC_LOSSES = 1
 COOLDOWN_SECONDS = 3 * 60 * 60  # 3 hours
@@ -53,10 +60,6 @@ STOP_BUFFER_PCT = 0.05 / 100  # 0.05%
 EMA_FAST = 9
 EMA_SLOW = 21
 
-# Websocket endpoints
-WS_MAINNET = "wss://api.hyperliquid.xyz/ws"
-WS_TESTNET = "wss://api.hyperliquid-testnet.xyz/ws"
-
 # Paper trading realism (conservative defaults)
 TAKER_FEE_PCT = 0.04 / 100    # 0.04% per side (we can tune later)
 ENTRY_SLIPPAGE_PCT = 0.02 / 100
@@ -71,6 +74,17 @@ BE_BUFFER_PCT = 0.01 / 100    # tiny buffer above entry for BE stop
 RETEST_BUF_ATR = 0.15
 ACCEPT_BARS = 2
 ATR_LEN = 14
+
+# Intraday Swing v2 params (Pine mirror)
+PIVOT_1H_LEN = int(os.getenv("PIVOT_1H_LEN", "3"))
+RSI_LEN      = int(os.getenv("RSI_LEN", "14"))
+RSI_LONG_MIN = int(os.getenv("RSI_LONG_MIN", "45"))
+RSI_SHORT_MAX= int(os.getenv("RSI_SHORT_MAX", "55"))
+ATR_BUF_MULT = float(os.getenv("ATR_BUF_MULT", "0.25"))
+TP1_QTY_PCT  = float(os.getenv("TP1_QTY_PCT", "50"))
+RISK_R       = float(os.getenv("RISK_R", "1.0"))
+REQUIRE_1H_EMA21_SIDE = os.getenv("REQUIRE_1H_EMA21_SIDE", "1") == "1"
+ALLOW_COUNTER_TREND   = os.getenv("ALLOW_COUNTER_TREND", "0") == "1"
 
 
 
