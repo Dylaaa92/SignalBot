@@ -22,3 +22,5 @@ stats.py
 trades/
 __pycache__/
 *.pyc
+data/snapshots.csv
+*.server_backup

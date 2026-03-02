@@ -24,6 +24,11 @@ def trade_file_path(symbol: str) -> str:
     return os.path.join(_TRADES_DIR, f"{symbol}-{_day_key_utc()}.jsonl")
 
 def append_event(symbol: str, event: dict):
+    # Tag every event so logs clearly show where it came from
+    event["strategy"] = os.getenv("STRATEGY", "")
+    event["trading_mode"] = os.getenv("TRADING_MODE", "")
+    event["service"] = os.getenv("SERVICE_NAME", "")
+
     """
     Append one JSON object per line.
     Safe for a single-process per symbol systemd setup.
@@ -31,10 +36,13 @@ def append_event(symbol: str, event: dict):
     event = dict(event)  # copy
     event.setdefault("ts_utc", _utc_now_iso())
     event.setdefault("symbol", symbol)
+    event["strategy"] = os.getenv("STRATEGY", "")
+    event["trading_mode"] = os.getenv("TRADING_MODE", "")
+    event["service"] = os.getenv("SERVICE_NAME", "")
 
     path = trade_file_path(symbol)
     line = json.dumps(event, separators=(",", ":"), ensure_ascii=False)
-
+    
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()

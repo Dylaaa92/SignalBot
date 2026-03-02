@@ -7,8 +7,6 @@ import subprocess
 import os
 import uuid
 
-from datetime import datetime, timezone
-
 from grid_engine import GridBot, GridParams
 from telegram_control import telegram_poll_commands
 
@@ -18,7 +16,7 @@ from config import (
     PIVOT_L,
     WS_URL,
     SYMBOL_PROFILES, DEFAULT_PROFILE, ENV,
-    TRADING_MODE,
+    STRATEGY,
 )
 
 from indicators import ema
@@ -27,143 +25,6 @@ from logger import log
 from notifier import notify
 from journal import Journal
 from trade_events import append_event, new_trade_id
-
-
-# ============================
-# DAILY LOSS LIMIT (NEW)
-# ============================
-
-DAILY_DD_LIMIT_PCT = float(os.getenv("DAILY_DD_LIMIT_PCT", "0.01"))  # 1% default
-HL_INFO_URL = os.getenv("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
-HL_ADDRESS = os.getenv("HL_ADDRESS", "").strip()  # your wallet address for /info userState lookups
-
-class RiskGuard:
-    """
-    Tracks equity drawdown per UTC day.
-    If drawdown >= DAILY_DD_LIMIT_PCT -> block NEW entries only.
-    """
-    def __init__(self, daily_dd_limit_pct: float):
-        self.daily_dd_limit_pct = daily_dd_limit_pct
-        self.day = None
-        self.equity_start = None
-        self.daily_stop = False
-        self._warned_no_addr = False
-        self._warned_fetch_fail = False
-
-    def maybe_reset_day(self, equity_now: float):
-        today = datetime.now(timezone.utc).date()
-        if self.day != today:
-            self.day = today
-            self.equity_start = equity_now
-            self.daily_stop = False
-
-    def update_and_check(self, equity_now: float) -> bool:
-        """
-        Returns True if trading allowed (new entries), False if daily stop triggered.
-        """
-        if equity_now is None:
-            # If we cannot fetch equity, do NOT brick trading.
-            return True
-
-        self.maybe_reset_day(equity_now)
-
-        if self.equity_start is None:
-            self.equity_start = equity_now
-
-        if self.equity_start <= 0:
-            return True
-
-        dd = (self.equity_start - equity_now) / self.equity_start
-        if dd >= self.daily_dd_limit_pct:
-            self.daily_stop = True
-
-        return not self.daily_stop
-
-risk_guard = RiskGuard(daily_dd_limit_pct=DAILY_DD_LIMIT_PCT)
-
-
-async def hl_user_state():
-    """
-    Fetch Hyperliquid userState (equity, margin) via /info.
-    Requires HL_ADDRESS env var.
-    """
-    if not HL_ADDRESS:
-        if not risk_guard._warned_no_addr:
-            log({"event": "risk_guard_no_hl_address", "note": "Set HL_ADDRESS to enable equity-based daily stop"})
-            risk_guard._warned_no_addr = True
-        return None
-
-    payload = {"type": "userState", "user": HL_ADDRESS}
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(HL_INFO_URL, json=payload)
-            r.raise_for_status()
-            return r.json()
-    except Exception as e:
-        if not risk_guard._warned_fetch_fail:
-            log({"event": "risk_guard_user_state_fetch_failed", "error": str(e)})
-            risk_guard._warned_fetch_fail = True
-        return None
-
-
-def parse_equity_usd(user_state: dict):
-    """
-    Try to parse account equity from userState.
-    Hyperliquid response shapes can vary slightly; we try a few common paths.
-    """
-    if not user_state or not isinstance(user_state, dict):
-        return None
-
-    # Common: user_state["marginSummary"]["accountValue"]
-    try:
-        ms = user_state.get("marginSummary") or {}
-        v = ms.get("accountValue")
-        if v is not None:
-            return float(v)
-    except Exception:
-        pass
-
-    # Fallback: sometimes "crossMarginSummary" etc.
-    for k in ("crossMarginSummary", "isolatedMarginSummary", "margin"):
-        try:
-            ms = user_state.get(k) or {}
-            v = ms.get("accountValue")
-            if v is not None:
-                return float(v)
-        except Exception:
-            continue
-
-    return None
-
-
-def parse_free_collateral_usd(user_state: dict):
-    """
-    Attempts to parse free/withdrawable collateral.
-    This may map to 'withdrawable' or a similar field depending on response.
-    """
-    if not user_state or not isinstance(user_state, dict):
-        return None
-
-    for key in ("withdrawable", "freeCollateral", "availableToWithdraw", "availableMargin"):
-        try:
-            v = user_state.get(key)
-            if v is not None:
-                return float(v)
-        except Exception:
-            continue
-
-    # Sometimes nested
-    try:
-        ms = user_state.get("marginSummary") or {}
-        for key in ("withdrawable", "freeCollateral", "availableMargin"):
-            v = ms.get(key)
-            if v is not None:
-                return float(v)
-    except Exception:
-        pass
-
-    return None
 
 
 # ============================
@@ -433,6 +294,8 @@ async def bootstrap_candles(symbol: str, tf_sec: int, limit=300):
     Bootstrap from hyperliquid REST-like endpoint (via Info API endpoint through httpx).
     Uses the same candle format as CandleBuilder.
     """
+    # NOTE: This is your existing bootstrap; leaving it intact.
+    # If you want volume/VWAP/POC later, this is where we'd extend.
     url = "https://api.hyperliquid.xyz/info"
     now = int(time.time() * 1000)
     start = now - (limit * tf_sec * 1000)
@@ -469,6 +332,7 @@ async def main():
     structure = StructureState()
     sig = SignalTradeState()
 
+    # Keep profiles in place (unused for stop now, but harmless)
     _profile = SYMBOL_PROFILES.get(SYMBOL, DEFAULT_PROFILE)
 
     candle_5m = CandleBuilder(TF_SECONDS)
@@ -490,13 +354,16 @@ async def main():
     log({"event": "bootstrapped", "candles_5m": len(candle_5m.candles), "candles_1h": len(candle_1h.candles)})
 
     sub_msg = {"method": "subscribe", "subscription": {"type": "allMids"}}
-    log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": TRADING_MODE, "signal_only"})
-    await notify(f"✅ Signalbot: {SYMBOL} | MODE={TRADING_MODE} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
+    log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
+    await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
 
+
+    # --- journaling session ---
     session_id = os.getenv("SESSION_ID", str(uuid.uuid4())[:8])
     journal = Journal(session_id=session_id)
     log({"event": "session_started", "session_id": session_id, "symbol": SYMBOL})
 
+    # --- optional grid bot ---
     global grid
     grid = None
     if os.getenv("GRID_ENABLED", "0") == "1":
@@ -534,7 +401,7 @@ async def main():
                         continue
                     last_candle_t = closed["t"]
 
-                    # --- journal snapshot ---
+                    # --- journal: 5m snapshot (OHLC only; volume/POC/VWAP not available from mids stream) ---
                     journal.write_snapshot({
                         "symbol": SYMBOL,
                         "tf": "5m",
@@ -550,6 +417,7 @@ async def main():
                         "rsi": "",
                     })
 
+                    # build 1h from 5m closes
                     candle_1h.update(closed["t"] + TF_SECONDS, closed["c"])
 
                     # --- heartbeat ---
@@ -558,18 +426,21 @@ async def main():
                         last_hb = now
                         log({"event": "heartbeat", "symbol": SYMBOL})
 
+                    # ---- need enough candles ----
                     if len(candle_5m.candles) < 120 or len(candle_1h.candles) < 40:
                         continue
 
                     c5_full = candle_5m.candles
                     c1 = candle_1h.candles
 
+                    # Use a consistent 5m window (align indices for pivots + timestamps)
                     c5w = c5_full[-300:]
                     closes5 = [c["c"] for c in c5w]
                     highs5 = [c["h"] for c in c5w]
                     lows5 = [c["l"] for c in c5w]
                     closes1 = [c["c"] for c in c1][-200:]
 
+                    # EMAs
                     efast5 = ema(closes5[-(EMA_FAST * 4):], EMA_FAST)
                     eslow5 = ema(closes5[-(EMA_SLOW * 4):], EMA_SLOW)
                     efast1 = ema(closes1[-(EMA_FAST * 4):], EMA_FAST)
@@ -582,6 +453,7 @@ async def main():
                     emaTrendLong = efast5 > eslow5
                     emaTrendShort = efast5 < eslow5
 
+                    # ATR + buffers (use same window list)
                     a = atr_from_candles(c5w, length=ATR_LEN)
                     if a is None:
                         continue
@@ -590,6 +462,7 @@ async def main():
                     struct_pad = a * STRUCT_PAD_ATR
                     atr_seatbelt_dist = a * ATR_SEATBELT_MULT
 
+                    # pivots (confirmed) on window
                     idx_hi = last_confirmed_swing_high(highs5, PIVOT_L)
                     idx_lo = last_confirmed_swing_low(lows5, PIVOT_L)
                     if idx_hi is None or idx_lo is None:
@@ -606,7 +479,7 @@ async def main():
                     # 1) Manage active signal first
                     # ============================
                     if sig.active:
-                        # (your existing manage logic unchanged)
+                        # PRE_TP1: initial stop + TP1
                         if sig.phase == "PRE_TP1":
                             if sig.side == "LONG":
                                 if closed["l"] <= sig.stop_init:
@@ -678,12 +551,15 @@ async def main():
                                     sig.struct_stop = None
                                     sig.atr_stop = None
 
+                        # RUNNER: best-of stops + EMA cross exit + time stop
                         elif sig.phase == "RUNNER":
                             sig.highest_high_since_tp1 = max(sig.highest_high_since_tp1, closed["h"])
                             sig.lowest_low_since_tp1 = min(sig.lowest_low_since_tp1, closed["l"])
 
+                            # BE stop
                             be_stop = (sig.entry + be_buf) if sig.side == "LONG" else (sig.entry - be_buf)
 
+                            # Structure trailing AFTER TP1 using timestamps (robust)
                             if sig.tp1_t is not None:
                                 if sig.side == "LONG":
                                     pidx = last_confirmed_swing_low(lows5, PIVOT_L)
@@ -696,6 +572,7 @@ async def main():
                                         new_struct_stop = highs5[pidx] + struct_pad
                                         sig.struct_stop = min(sig.struct_stop, new_struct_stop) if sig.struct_stop is not None else new_struct_stop
 
+                            # ATR seatbelt trail
                             if sig.side == "LONG":
                                 new_atr_stop = sig.highest_high_since_tp1 - atr_seatbelt_dist
                                 sig.atr_stop = max(sig.atr_stop, new_atr_stop) if sig.atr_stop is not None else new_atr_stop
@@ -703,6 +580,7 @@ async def main():
                                 new_atr_stop = sig.lowest_low_since_tp1 + atr_seatbelt_dist
                                 sig.atr_stop = min(sig.atr_stop, new_atr_stop) if sig.atr_stop is not None else new_atr_stop
 
+                            # Best protection stop
                             if sig.side == "LONG":
                                 runner_stop = be_stop
                                 if sig.struct_stop is not None:
@@ -710,6 +588,7 @@ async def main():
                                 if sig.atr_stop is not None:
                                     runner_stop = max(runner_stop, sig.atr_stop)
 
+                                # stop tagged?
                                 if closed["l"] <= runner_stop:
                                     await notify(f"{SYMBOL} LONG RUNNER 🏁 stop hit {runner_stop:.2f}")
                                     safe_append({
@@ -805,6 +684,7 @@ async def main():
                                         })
                                         sig.clear()
 
+                    # Update prev EMA values for next-bar cross detection
                     sig.prev_efast5 = efast5
                     sig.prev_eslow5 = eslow5
 
@@ -812,12 +692,14 @@ async def main():
                     # 2) Structure state machine (only if not in active trade)
                     # ============================
                     if not sig.active:
+                        # If bias/trend flips while waiting, drop setup
                         if structure.waitingRetest:
                             if structure.direction == "LONG" and (not biasLong or not emaTrendLong):
                                 structure.reset()
                             elif structure.direction == "SHORT" and (not biasShort or not emaTrendShort):
                                 structure.reset()
 
+                        # Arm BOS -> WAIT_RETEST
                         if bosUp and biasLong and emaTrendLong:
                             structure.reset()
                             structure.direction = "LONG"
@@ -836,6 +718,7 @@ async def main():
                             structure.accCount = 0
                             structure.bosSwingHigh = lastSwingHigh
 
+                        # Retest
                         if structure.waitingRetest and structure.bosLevel is not None:
                             if structure.direction == "LONG":
                                 if closed["l"] <= (structure.bosLevel + retest_buf):
@@ -846,6 +729,7 @@ async def main():
                                     structure.retestRef = structure.bosLevel
                                     structure.accCount = 0
 
+                        # Acceptance closes
                         if structure.waitingRetest and structure.retestRef is not None:
                             if structure.direction == "LONG":
                                 structure.accCount = structure.accCount + 1 if closed["c"] > structure.retestRef else 0
@@ -854,42 +738,143 @@ async def main():
 
                         accepted = structure.waitingRetest and structure.retestRef is not None and structure.accCount >= ACCEPT_BARS
 
-                        # ============================
-                        # 2.5) DAILY STOP CHECK (NEW)
-                        # ============================
-                        # Only check daily stop when we are about to consider a NEW entry
-                        can_enter = True
-                        equity_now = None
-                        free_collateral = None
+                        # --- journal: decision report (rule-based) ---
+                        # Determine working direction even before acceptance
+                        working_dir = structure.direction
+                        if working_dir is None:
+                            if bosUp:
+                                working_dir = "LONG"
+                            elif bosDown:
+                                working_dir = "SHORT"
 
-                        if accepted:
-                            user_state = await hl_user_state()
-                            equity_now = parse_equity_usd(user_state) if user_state else None
-                            free_collateral = parse_free_collateral_usd(user_state) if user_state else None
+                        gates_required = ["bias_1h", "ema_trend_5m", "bos", "retest", "acceptance"]
+                        gates_passed = []
+                        gates_failed = []
 
-                            can_enter = risk_guard.update_and_check(equity_now)
+                        # Gate: BOS (satisfied once we're in BOS->retest state)
+                        bos_gate = bool(structure.waitingRetest)
+                        (gates_passed if bos_gate else gates_failed).append("bos")
 
-                            if not can_enter:
-                                safe_append({
-                                    "type": "DAILY_STOP",
-                                    "symbol": SYMBOL,
-                                    "equity_start": risk_guard.equity_start,
-                                    "equity_now": equity_now,
-                                    "dd_limit_pct": risk_guard.daily_dd_limit_pct,
-                                    "t": closed["t"],
-                                })
-                                log({
-                                    "event": "daily_stop_triggered",
-                                    "symbol": SYMBOL,
-                                    "equity_start": risk_guard.equity_start,
-                                    "equity_now": equity_now,
-                                    "dd_limit_pct": risk_guard.daily_dd_limit_pct,
-                                })
+                        # Gate: Retest
+                        retest_gate = bool(structure.retestRef is not None)
+                        (gates_passed if retest_gate else gates_failed).append("retest")
+
+                        # Gate: Acceptance
+                        acc_gate = bool(accepted)
+                        (gates_passed if acc_gate else gates_failed).append("acceptance")
+
+                        # Gates: bias + ema trend depend on direction
+                        if working_dir == "LONG":
+                            (gates_passed if biasLong else gates_failed).append("bias_1h")
+                            (gates_passed if emaTrendLong else gates_failed).append("ema_trend_5m")
+                        elif working_dir == "SHORT":
+                            (gates_passed if biasShort else gates_failed).append("bias_1h")
+                            (gates_passed if emaTrendShort else gates_failed).append("ema_trend_5m")
+                        else:
+                            gates_failed.extend(["bias_1h", "ema_trend_5m"])
+
+                        # Action classification
+                        if sig.active:
+                            action = "MANAGE"
+                        elif accepted and working_dir == "LONG" and biasLong and emaTrendLong:
+                            action = "ENTER_LONG"
+                        elif accepted and working_dir == "SHORT" and biasShort and emaTrendShort:
+                            action = "ENTER_SHORT"
+                        elif structure.waitingRetest:
+                            action = "WATCH"
+                        else:
+                            action = "NO_TRADE"
+
+                        # Risk plan (only filled on ENTER_*)
+                        entry_px = closed["c"] if action in ("ENTER_LONG", "ENTER_SHORT") else ""
+                        stop_px = ""
+                        tp1_px = ""
+                        rr_to_tp1 = ""
+                        inv_px = ""
+
+                        if action == "ENTER_LONG" and structure.bosSwingLow is not None:
+                            stop_px = float(structure.bosSwingLow) - (a * 0.10)
+                            inv_px = stop_px
+                            R_tmp = float(entry_px) - stop_px
+                            if R_tmp > 0:
+                                tp1_px = float(entry_px) + TP1_R_MULT * R_tmp
+                                rr_to_tp1 = 1.0
+                        elif action == "ENTER_SHORT" and structure.bosSwingHigh is not None:
+                            stop_px = float(structure.bosSwingHigh) + (a * 0.10)
+                            inv_px = stop_px
+                            R_tmp = stop_px - float(entry_px)
+                            if R_tmp > 0:
+                                tp1_px = float(entry_px) - TP1_R_MULT * R_tmp
+                                rr_to_tp1 = 1.0
+
+                        confidence = int(100 * (len(set(gates_passed)) / max(1, len(set(gates_required)))))
+
+                        report = {
+                            "symbol": SYMBOL,
+                            "mode": "signal_only",
+                            "strategy": "BOS_RETEST_ACCEPT_V1",
+                            "data_fresh_ms": int((time.time() - (closed["t"] + TF_SECONDS)) * 1000),
+                            "px_last": closed["c"],
+                            "spread_bps": "",
+                            "vwap_5m": "",
+                            "poc_5m": "",
+                            "vwap_1h": "",
+                            "poc_1h": "",
+                            "ema9_1h": efast1,
+                            "ema21_1h": eslow1,
+                            "bias_1h": "LONG" if biasLong else ("SHORT" if biasShort else "NEUTRAL"),
+                            "bias_reason": "ema9>ema21" if biasLong else ("ema9<ema21" if biasShort else "flat"),
+                            "rsi_1h": "",
+                            "bos_dir": "UP" if bosUp else ("DOWN" if bosDown else "NONE"),
+                            "bos_level": structure.bosLevel or "",
+                            "retest_level": structure.retestRef or "",
+                            "retest_state": "TOUCHED" if structure.retestRef is not None else ("ARMED" if structure.waitingRetest else "NONE"),
+                            "acceptance_bars": structure.accCount or 0,
+                            "acceptance_required": ACCEPT_BARS,
+                            "acceptance_state": "PASS" if accepted else ("FAIL" if structure.retestRef is not None else "NA"),
+                            "vol_5m": "",
+                            "vol_ma_20": "",
+                            "vol_state": "NA",
+                            "vol_reason": "",
+                            "entry_plan": "LIMIT" if action in ("ENTER_LONG", "ENTER_SHORT") else "NONE",
+                            "entry_px": entry_px,
+                            "invalidation_px": inv_px,
+                            "stop_px": stop_px,
+                            "tp1_px": tp1_px,
+                            "runner_trail": "ATR+STRUCTURE",
+                            "rr_to_tp1": rr_to_tp1,
+                            "gates_required": gates_required,
+                            "gates_passed": sorted(set(gates_passed)),
+                            "gates_failed": sorted(set(gates_failed)),
+                            "action": action,
+                            "confidence": confidence,
+                            "notes": "",
+                        }
+
+                        journal.write_decision(report)
+
+                        # If we're signaling an entry, also write a trade-intent row (paper journal)
+                        if action in ("ENTER_LONG", "ENTER_SHORT"):
+                            journal.write_trade({
+                                "symbol": SYMBOL,
+                                "side": "LONG" if action == "ENTER_LONG" else "SHORT",
+                                "qty": "",
+                                "entry_px": entry_px,
+                                "stop_px": stop_px,
+                                "tp1_px": tp1_px,
+                                "exit_px": "",
+                                "pnl_usd": "",
+                                "pnl_r": "",
+                                "reason": "|".join(sorted(set(gates_passed))),
+                                "order_id": "",
+                                "fill_id": "",
+                                "mode": "signal_only",
+                            })
 
                         # ============================
                         # 3) Entry (signal-only) + init TP1 + JSON ENTER event
                         # ============================
-                        if accepted and can_enter:
+                        if accepted:
                             entry = closed["c"]
 
                             if structure.direction == "LONG" and biasLong and emaTrendLong:
@@ -928,8 +913,6 @@ async def main():
                                             "ema5_slow": eslow5,
                                             "ema1_fast": efast1,
                                             "ema1_slow": eslow1,
-                                            "equity_now": equity_now,
-                                            "free_collateral": free_collateral,
                                             "t": closed["t"],
                                         })
 
@@ -978,8 +961,6 @@ async def main():
                                             "ema5_slow": eslow5,
                                             "ema1_fast": efast1,
                                             "ema1_slow": eslow1,
-                                            "equity_now": equity_now,
-                                            "free_collateral": free_collateral,
                                             "t": closed["t"],
                                         })
 
@@ -994,19 +975,219 @@ async def main():
                             else:
                                 structure.reset()
 
-                        elif accepted and not can_enter:
-                            # Daily stop hit — just clear structure and wait for next setups
-                            structure.reset()
-
         except Exception as e:
             log({"event": "ws_disconnected", "error": str(e)})
             await asyncio.sleep(5)
 
+async def main_intraday_swing_v2():
+    """
+    Intraday Swing v2 runner:
+      - 4H bias
+      - 1H BOS (pivot break)
+      - 15m reclaim entry + RSI filter
+      - Paper mode uses Executor paper ledger
+      - Live mode guarded by LIVE_GUARD=I_UNDERSTAND
+    """
+    from executor import Executor
+    from strategies.intraday_swing_v2 import candle_snapshot, decide
+    from config import (
+        ENV, SYMBOL,
+        EMA_FAST, EMA_SLOW,
+        EXEC_TF_SECONDS, STRUCT_TF_SECONDS, BIAS_TF_SECONDS,
+        PIVOT_1H_LEN, RSI_LEN, RSI_LONG_MIN, RSI_SHORT_MAX,
+        ATR_BUF_MULT, TP1_QTY_PCT, RISK_R,
+        REQUIRE_1H_EMA21_SIDE, ALLOW_COUNTER_TREND,
+        RISK_USDT_PER_TRADE,
+        TRADING_MODE,
+    )
+    from logger import log
+    from notifier import notify
+    from trade_events import append_event, new_trade_id
+
+    exec_layer = Executor(env=ENV, symbol=SYMBOL)
+
+    params = {
+        "EMA_FAST": EMA_FAST,
+        "EMA_SLOW": EMA_SLOW,
+        "PIVOT_1H_LEN": PIVOT_1H_LEN,
+        "RSI_LEN": RSI_LEN,
+        "RSI_LONG_MIN": RSI_LONG_MIN,
+        "RSI_SHORT_MAX": RSI_SHORT_MAX,
+        "ATR_BUF_MULT": ATR_BUF_MULT,
+        "TP1_QTY_PCT": TP1_QTY_PCT,
+        "RISK_R": RISK_R,
+        "REQUIRE_1H_EMA21_SIDE": REQUIRE_1H_EMA21_SIDE,
+        "ALLOW_COUNTER_TREND": ALLOW_COUNTER_TREND,
+    }
+
+    log({"event": "startup", "symbol": SYMBOL, "strategy": "INTRADAY_SWING_V2", "mode": TRADING_MODE})
+    await notify(f"✅ Intraday Swing v2 running: {SYMBOL} | mode={TRADING_MODE} | 4H/1H/15m")
+
+    last_15m_t = None
+    in_trade = False
+    trade_side = None
+    entry_px = None
+    stop_px = None
+    tp1_px = None
+    tp1_done = False
+    trade_id = None
+    size = 0.0
+
+    while True:
+        try:
+            c15 = await candle_snapshot(SYMBOL, EXEC_TF_SECONDS, limit=260)
+            c1h = await candle_snapshot(SYMBOL, STRUCT_TF_SECONDS, limit=260)
+            c4h = await candle_snapshot(SYMBOL, BIAS_TF_SECONDS, limit=260)
+
+            if not c15:
+                await asyncio.sleep(10)
+                continue
+
+            closed15 = c15[-1]
+            if last_15m_t is not None and closed15["t"] == last_15m_t:
+                await asyncio.sleep(10)
+                continue
+            last_15m_t = closed15["t"]
+
+            d = decide(params, c15, c1h, c4h)
+
+            # --- Manage open trade (paper stop/tp1 only; runner exits later)
+            if in_trade:
+                lo = closed15["l"]
+                hi = closed15["h"]
+                cl = closed15["c"]
+
+                # STOP
+                if trade_side == "LONG" and lo <= stop_px:
+                    if TRADING_MODE == "paper":
+                        await exec_layer.paper_close(exit_price=stop_px, reason="STOP")
+                    else:
+                        await exec_layer.live_close_marketlike(side="LONG", size=size)
+
+                    append_event(SYMBOL, {
+                        "type": "STOP",
+                        "trade_id": trade_id,
+                        "side": trade_side,
+                        "exit_price": stop_px,
+                        "t": closed15["t"],
+                    })
+                    await notify(f"{SYMBOL} LONG ❌ STOP hit {stop_px:.2f} | id={trade_id}")
+
+                    in_trade = False
+                    continue
+
+                if trade_side == "SHORT" and hi >= stop_px:
+                    if TRADING_MODE == "paper":
+                        await exec_layer.paper_close(exit_price=stop_px, reason="STOP")
+                    else:
+                        await exec_layer.live_close_marketlike(side="SHORT", size=size)
+
+                    append_event(SYMBOL, {
+                        "type": "STOP",
+                        "trade_id": trade_id,
+                        "side": trade_side,
+                        "exit_price": stop_px,
+                        "t": closed15["t"],
+                    })
+                    await notify(f"{SYMBOL} SHORT ❌ STOP hit {stop_px:.2f} | id={trade_id}")
+
+                    in_trade = False
+                    continue
+
+                # TP1
+                if (not tp1_done) and trade_side == "LONG" and hi >= tp1_px:
+                    tp1_done = True
+                    if TRADING_MODE == "paper":
+                        await exec_layer.paper_tp1(tp_price=tp1_px, qty_pct=TP1_QTY_PCT)
+                    append_event(SYMBOL, {
+                        "type": "TP1",
+                        "trade_id": trade_id,
+                        "side": trade_side,
+                        "tp1": tp1_px,
+                        "t": closed15["t"],
+                    })
+                    await notify(f"{SYMBOL} LONG ✅ TP1 hit {tp1_px:.2f} | id={trade_id}")
+
+                if (not tp1_done) and trade_side == "SHORT" and lo <= tp1_px:
+                    tp1_done = True
+                    if TRADING_MODE == "paper":
+                        await exec_layer.paper_tp1(tp_price=tp1_px, qty_pct=TP1_QTY_PCT)
+                    append_event(SYMBOL, {
+                        "type": "TP1",
+                        "trade_id": trade_id,
+                        "side": trade_side,
+                        "tp1": tp1_px,
+                        "t": closed15["t"],
+                    })
+                    await notify(f"{SYMBOL} SHORT ✅ TP1 hit {tp1_px:.2f} | id={trade_id}")
+
+                # (Runner logic comes next iteration — we’ll add EMA9 1H runner exit after TP1 next)
+                await asyncio.sleep(1)
+                continue
+
+            # --- Entry logic
+            if d.get("action") in ("ENTER_LONG", "ENTER_SHORT"):
+                trade_side = "LONG" if d["action"] == "ENTER_LONG" else "SHORT"
+                entry_px = float(d["entry_px"])
+                stop_px = float(d["stop_px"])
+                tp1_px = float(d["tp1_px"])
+                tp1_done = False
+                trade_id = new_trade_id()
+
+                # Position sizing: simple fixed USD risk / stop distance (no leverage math yet)
+                risk_per_unit = abs(entry_px - stop_px)
+                if risk_per_unit <= 0:
+                    await asyncio.sleep(10)
+                    continue
+
+                size = max(0.0, float(RISK_USDT_PER_TRADE) / risk_per_unit)
+
+                if size <= 0:
+                    await asyncio.sleep(10)
+                    continue
+
+                if TRADING_MODE == "paper":
+                    await exec_layer.paper_open(side=trade_side, size=size if trade_side == "LONG" else -size, entry_px=entry_px, trade_id=trade_id)
+                else:
+                    await exec_layer.live_open_marketlike(side=trade_side, size=size)
+
+                append_event(SYMBOL, {
+                    "type": "ENTER",
+                    "trade_id": trade_id,
+                    "side": trade_side,
+                    "entry": entry_px,
+                    "stop": stop_px,
+                    "tp1": tp1_px,
+                    "size": size,
+                    "t": closed15["t"],
+                })
+
+                await notify(
+                    f"{SYMBOL} {trade_side} ✅ ENTER\n"
+                    f"entry={entry_px:.2f} stop={stop_px:.2f} tp1={tp1_px:.2f}\n"
+                    f"risk_usd={RISK_USDT_PER_TRADE} size≈{size:.4f}\n"
+                    f"id={trade_id}"
+                )
+
+                in_trade = True
+
+            await asyncio.sleep(10)
+
+        except Exception as e:
+            log({"event": "intraday_v2_error", "error": str(e)})
+            await asyncio.sleep(5)
 
 async def run_all():
-    tasks = [main()]
+    tasks = []
+
+    if STRATEGY == "INTRADAY_SWING_V2":
+        tasks.append(main_intraday_swing_v2())
+    else:
+        tasks.append(main())
+
     if os.getenv("TELEGRAM_CONTROL", "0") == "1":
         tasks.append(telegram_poll_commands(handle_command))
+
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
