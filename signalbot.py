@@ -18,6 +18,7 @@ from config import (
     PIVOT_L,
     WS_URL,
     SYMBOL_PROFILES, DEFAULT_PROFILE, ENV,
+    TRADING_MODE,
 )
 
 from indicators import ema
