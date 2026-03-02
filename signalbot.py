@@ -490,8 +490,8 @@ async def main():
     log({"event": "bootstrapped", "candles_5m": len(candle_5m.candles), "candles_1h": len(candle_1h.candles)})
 
     sub_msg = {"method": "subscribe", "subscription": {"type": "allMids"}}
-    log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": "signal_only"})
-    await notify(f"✅ Signalbot LIVE: {SYMBOL} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
+    log({"event": "startup", "ws": WS_URL, "symbol": SYMBOL, "mode": TRADING_MODE, "signal_only"})
+    await notify(f"✅ Signalbot: {SYMBOL} | MODE={TRADING_MODE} | ENV={ENV} | 5m exec / 1h bias | BOS→Retest→Accept(1) | TP1+Runner | JSONL events")
 
     session_id = os.getenv("SESSION_ID", str(uuid.uuid4())[:8])
     journal = Journal(session_id=session_id)
